@@ -211,7 +211,19 @@ async function resolveOwner(req) {
     const s = await getAccountSession(t);
     if (s) {
       const acc = await getAccountByEmail(s.email);
-      if (acc) return { owner: 'acct:' + String(s.email).toLowerCase(), account: acc, token: t };
+      if (acc) {
+        const owner = 'acct:' + String(s.email).toLowerCase();
+        /* The device may already hold data under 'tg:<id>' from before the
+           account existed. Move it into the account once, so signing in does
+           not look like losing everything. */
+        if (s.telegram_id) {
+          try {
+            const has = await getStateByOwner(owner);
+            if (!has) await migrateState('tg:' + String(s.telegram_id), owner);
+          } catch (e) { console.warn('[owner] migration failed:', e.message); }
+        }
+        return { owner, account: acc, token: t, telegramId: s.telegram_id };
+      }
     }
   }
   const u = await resolveUser(req);
@@ -323,9 +335,25 @@ app.post('/api/account/register', async (req, res) => {
     if (u && u.id) telegramId = String(u.id);
 
     await createAccount(e, password, telegramId);
+    const owner = 'acct:' + e;
+    if (telegramId) {
+      /* Data collected on this device before registration stays with the user. */
+      try {
+        const has = await getStateByOwner(owner);
+        if (!has) await migrateState('tg:' + String(telegramId), owner);
+      } catch (e) { console.warn('[owner] migration on register failed:', e.message); }
+    }
+    const ownerAcc = 'acct:' + e;
+    if (telegramId) {
+      /* Signing in on a device that already had local data: merge it in. */
+      try {
+        const has = await getStateByOwner(ownerAcc);
+        if (!has) await migrateState('tg:' + String(telegramId), ownerAcc);
+      } catch (e) { console.warn('[owner] migration on login failed:', e.message); }
+    }
     const token = 'acct_' + accountToken();
     await saveAccountSession(token, e, telegramId, accountExpiry());
-    res.json({ ok: true, token, email: e });
+    res.json({ ok: true, token, email: e, telegram_id: telegramId });
   } catch (e) {
     console.error('[account:register]', e.message);
     res.status(500).json({ error: 'server_error' });
@@ -347,6 +375,14 @@ app.post('/api/account/login', async (req, res) => {
       if (!acc.telegram_id || String(acc.telegram_id) !== telegramId) {
         await linkAccountToTelegram(e, telegramId);
       }
+    }
+    const ownerAcc = 'acct:' + e;
+    if (telegramId) {
+      /* Signing in on a device that already had local data: merge it in. */
+      try {
+        const has = await getStateByOwner(ownerAcc);
+        if (!has) await migrateState('tg:' + String(telegramId), ownerAcc);
+      } catch (e) { console.warn('[owner] migration on login failed:', e.message); }
     }
     const token = 'acct_' + accountToken();
     await saveAccountSession(token, e, telegramId, accountExpiry());

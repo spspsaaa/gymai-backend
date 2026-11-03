@@ -85,30 +85,6 @@ async function resolveUser(req) {
   return null;
 }
 
-/* Temporary diagnostics: describe how initData parses (no secrets returned). */
-app.post('/api/debug-auth', async (req, res) => {
-  const body = req.body || {};
-  const initData = body.initData || (req.headers['x-init-data'] || '');
-  const { parseInitData } = await import('./src/telegram.js');
-  const raw = parseInitData(initData);
-  const keys = Object.keys(raw);
-  const info = {
-    received: true,
-    len: String(initData || '').length,
-    keys: keys,
-    hasHash: !!raw.hash,
-    hasSignature: !!raw.signature,
-    hasUser: !!raw.user,
-    authDate: raw.auth_date || null,
-    userPreview: raw.user ? String(raw.user).slice(0, 60) : null,
-    botTokenSet: !!BOT_TOKEN,
-  };
-  const verified = verifyInitData(initData, BOT_TOKEN);
-  info.verified = verified ? { id: verified.id, username: verified.username } : null;
-  console.warn('[debug-auth]', JSON.stringify(info));
-  res.json(info);
-});
-
 app.get('/health', async (req, res) => {
   res.json({ ok: true, ai: !!process.env.AI_API_KEY, bot: !!BOT_TOKEN });
 });

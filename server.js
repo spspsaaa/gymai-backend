@@ -1,7 +1,10 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
-import { init, getUser, saveState, setPlan, bumpCoach, getState, saveSession, getSession } from './src/db.js';
+import {
+  init, getUser, upsertUser, saveState, setPlan, getState,
+  saveSession, getSession, reserveCoach, refundCoach,
+} from './src/db.js';
 import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
 
@@ -11,31 +14,39 @@ app.use(express.json({ limit: '2mb' }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const FREE_COACH_LIMIT = Number(process.env.FREE_COACH_LIMIT || 20);
+const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED === '1';
+const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky-3f0d63ky.agent.mira.tg';
 
+function safeEqual(a, b) {
+  const x = Buffer.from(String(a));
+  const y = Buffer.from(String(b));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
 
-/* Resolve a user from initData.
-   Verified HMAC signature first. If it fails and ALLOW_UNVERIFIED=1 is set,
-   fall back to the initData payload (needed when initData was issued by a
-   different/older bot token and can no longer be signature-verified). */
+/* Resolve a Telegram user from initData.
+   1) verified HMAC signature (normal path);
+   2) no BOT_TOKEN configured (local dev) -> trust the payload;
+   3) ALLOW_UNVERIFIED=1 -> trust the payload (temporary escape hatch, e.g.
+      initData issued by an older bot token). Turn it off when not needed:
+      with it on, anyone can impersonate any Telegram id. */
 function resolveInitUser(initData) {
+  if (!initData) return null;
   const v = verifyInitData(initData, BOT_TOKEN);
-  if (v && v.id) return { user: v, verified: true };
-  if (process.env.ALLOW_UNVERIFIED === '1') {
+  if (v && v.id) return v;
+
+  if (!BOT_TOKEN) return userFromInitDataUnverified(initData);
+
+  if (ALLOW_UNVERIFIED) {
     const u = userFromInitDataUnverified(initData);
     if (u) {
       console.warn('[auth] initData accepted WITHOUT signature verification (ALLOW_UNVERIFIED=1) id=' + u.id);
-      return { user: u, verified: false };
+      return u;
     }
   }
-  return { user: null, verified: false };
+  return null;
 }
 
-import { upsertUser as _upsertUser } from './src/db.js';
-
-
 /* ---- Telegram bot: reply with an inline button that opens the mini app ---- */
-const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky-3f0d63ky.agent.mira.tg';
-
 async function telegramCall(method, payload) {
   if (!BOT_TOKEN) return null;
   try {
@@ -43,6 +54,7 @@ async function telegramCall(method, payload) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload || {}),
+      signal: AbortSignal.timeout(10000),
     });
     return await r.json().catch(() => null);
   } catch (e) {
@@ -52,45 +64,45 @@ async function telegramCall(method, payload) {
 }
 
 const APP_BTN = {
-  inline_keyboard: [[{ text: '\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043a\u0443', web_app: { url: WEBAPP_URL } }]],
+  reply_markup: {
+    inline_keyboard: [[{ text: 'Открыть GYM AI', web_app: { url: WEBAPP_URL } }]],
+  },
 };
 
-async function sendWelcome(chatId) {
-  return telegramCall('sendMessage', {
-    chat_id: chatId,
-    text: '\u041f\u0440\u0438\u0432\u0435\u0442! \u042f \u0438\u0438\u0440\u043e\u0432\u043e\u0439 \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043e\u0447\u043d\u044b\u0439 \u043a\u043e\u0449. \u041e\u0442\u043a\u0440\u043e\u0439 \u043f\u043b\u0430\u043d \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043a\u0443, \u0430\u0438 \u0438\u0434\u0435\u0441\u044c \u0441\u043f\u0440\u043e\u0441\u0438 \u0442\u044b \u043f\u0438\u0448\u0438 \u0441\u043a\u0430\u0436\u0435 \u0432 \u043e\u0434\u043d\u043e\u043c \u0447\u0430\u0442\u0435.\n\n\u041d\u0430\u0436\u043c\u0438 \u043a\u043d\u043e\u043f\u043a\u0443 \u2014 \u043f\u0440\u044f\u043c\u043e \u0441\u0442\u0430\u0440\u0442 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u044f.\n\u0427\u0442\u043e \u0442\u044b \u0445\u043e\u0447\u0435\u0448\u044c \u0441\u0434\u0435\u043b\u0430\u0442\u044c:',
-    ...APP_BTN,
-    disable_web_page_preview: true,
-  });
-}
+const WELCOME_TEXT =
+  'Привет! Я GYM AI — твой тренировочный помощник.\n\n' +
+  'В приложении: план тренировок, журнал, прогресс и AI-тренер, которому можно задать любой вопрос.\n\n' +
+  'Нажми кнопку ниже, чтобы начать.';
+
+const FALLBACK_TEXT = 'Нажми кнопку ниже, чтобы открыть мини-апп и начать тренировку.';
 
 app.post('/api/tg/webhook', async (req, res) => {
   const secret = process.env.TG_WEBHOOK_SECRET || '';
-  if (secret && req.headers['x-telegram-bot-api-secret-token'] !== secret) {
+  if (secret && !safeEqual(req.headers['x-telegram-bot-api-secret-token'] || '', secret)) {
     return res.status(403).json({ error: 'forbidden' });
   }
   try {
     const up = req.body || {};
     const msg = up.message || up.edited_message;
-    if (msg && msg.chat && msg.chat.type !== 'channel') {
+    if (msg && msg.chat && msg.chat.type === 'private') {
       const chatId = msg.chat.id;
       const text = String(msg.text || '').trim();
       if (/^\/start/i.test(text)) {
-        const u = await getUser(String(msg.from && msg.from.id));
-        if (!u && msg.from) {
-          await upsertUserSafe(String(msg.from.id), {
-            username: msg.from.username || '',
-            first_name: msg.from.first_name || '',
-            lang: msg.from.language_code || '',
-          });
+        if (msg.from) {
+          const id = String(msg.from.id);
+          if (!(await getUser(id))) {
+            await upsertUserSafe(id, {
+              username: msg.from.username || '',
+              first_name: msg.from.first_name || '',
+              lang: msg.from.language_code || '',
+            });
+          }
         }
-        await sendWelcome(chatId);
-      } else if (text) {
         await telegramCall('sendMessage', {
-          chat_id: chatId,
-          text: '\u041e\u0442\u043a\u0440\u043e\u0439 \u043a\u043d\u043e\u043f\u043a\u0438 \u2014 \u043e\u0442\u043a\u0440\u043e\u0435 \u043c\u0438\u043d\u0438-\u0430\u043f\u043f, \u043f\u043e\u0434\u0442\u0430\u0439\u0441\u044f \u043f\u0440\u044f\u043c\u043e\u0441\u0442\u044c \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043a\u0443.',
-          ...APP_BTN,
+          chat_id: chatId, text: WELCOME_TEXT, disable_web_page_preview: true, ...APP_BTN,
         });
+      } else if (text) {
+        await telegramCall('sendMessage', { chat_id: chatId, text: FALLBACK_TEXT, ...APP_BTN });
       }
     }
     return res.json({ ok: true });
@@ -101,9 +113,10 @@ app.post('/api/tg/webhook', async (req, res) => {
 });
 
 async function upsertUserSafe(id, patch) {
-  try { await _upsertUser(id, patch); } catch (e) {}
+  try { await upsertUser(id, patch); } catch (e) { console.warn('[db] upsert failed', String(e).slice(0, 120)); }
 }
 
+/* ---- sessions (persisted in the DB, cached in memory) ---- */
 const sessions = new Map(); // token -> telegram user
 
 function newToken() {
@@ -130,112 +143,102 @@ async function resolveUser(req) {
   if (u) return u;
 
   const body = req.body || {};
-  const initData = body.initData || (req.headers['x-init-data'] || '');
+  const initData = body.initData || req.headers['x-init-data'] || '';
   if (!initData) {
     console.warn('[auth] no initData and no valid token');
     return null;
   }
   const ru = resolveInitUser(initData);
-  if (ru.user) return ru.user;
-  console.warn('[auth] verifyInitData failed, len=' + String(initData).length);
-
-  // No BOT_TOKEN configured (local dev) - trust initData payload.
-  if (!BOT_TOKEN && initData) {
-    const { parseInitData } = await import('./src/telegram.js');
-    const raw = parseInitData(initData);
-    if (raw.user) {
-      try {
-        const u2 = JSON.parse(raw.user);
-        return {
-          id: String(u2.id),
-          username: u2.username || '',
-          first_name: u2.first_name || '',
-          last_name: u2.last_name || '',
-          lang: raw.language_code || '',
-        };
-      } catch (e) {}
-    }
-  }
-  return null;
+  if (!ru) console.warn('[auth] initData rejected, len=' + String(initData).length);
+  return ru;
 }
 
-app.get('/health', async (req, res) => {
+app.get('/health', (req, res) => {
   res.json({ ok: true, ai: !!process.env.AI_API_KEY, bot: !!BOT_TOKEN });
 });
 
 app.post('/api/auth', async (req, res) => {
-  const { initData = '' } = req.body || {};
-  let u = resolveInitUser(initData).user;
-  if (!u && !BOT_TOKEN) {
-    const { parseInitData } = await import('./src/telegram.js');
-    const raw = parseInitData(initData);
-    if (raw.user) {
-      try {
-        const u2 = JSON.parse(raw.user);
-        u = {
-          id: String(u2.id),
-          username: u2.username || '',
-          first_name: u2.first_name || '',
-          last_name: u2.last_name || '',
-          lang: raw.language_code || '',
-        };
-      } catch (e) {}
+  try {
+    const { initData = '' } = req.body || {};
+    const u = resolveInitUser(initData);
+    if (!u || !u.id) return res.status(401).json({ error: 'bad_init_data' });
+
+    let rec = await getUser(u.id);
+    if (!rec) {
+      await upsertUser(u.id, {
+        username: u.username, first_name: u.first_name, lang: u.lang,
+        plan: 'free', coach_used: 0, state: null,
+      });
+      rec = await getUser(u.id);
+    } else if (u.username !== rec.username || u.first_name !== rec.first_name) {
+      await upsertUser(u.id, { username: u.username, first_name: u.first_name });
     }
-  }
-  if (!u || !u.id) return res.status(401).json({ error: 'bad_init_data' });
 
-  let rec = await getUser(u.id);
-  if (!rec) {
-    await (await import('./src/db.js')).upsertUser(u.id, {
-      username: u.username, first_name: u.first_name, lang: u.lang, plan: 'free', coach_used: 0, state: null,
+    const token = newToken();
+    sessions.set(token, u);
+    await saveSession(token, u);
+    res.json({
+      token,
+      user: {
+        id: u.id,
+        username: u.username,
+        first_name: u.first_name,
+        lang: rec?.lang || u.lang || 'ru',
+        plan: rec?.plan || 'free',
+        coach_used: Number(rec?.coach_used || 0),
+      },
     });
-    rec = await getUser(u.id);
+  } catch (e) {
+    console.error('[auth]', e.message);
+    res.status(500).json({ error: 'server_error' });
   }
-
-  const token = newToken();
-  sessions.set(token, u);
-  await saveSession(token, u);
-  res.json({
-    token,
-    user: {
-      id: u.id,
-      username: u.username,
-      first_name: u.first_name,
-      lang: rec?.lang || u.lang || 'ru',
-      plan: rec?.plan || 'free',
-      coach_used: Number(rec?.coach_used || 0),
-    },
-  });
 });
 
 app.get('/api/state', async (req, res) => {
-  const u = await resolveUser(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
-  const state = await getState(u.id);
-  res.json({ state: state || {} });
+  try {
+    const u = await resolveUser(req);
+    if (!u) return res.status(401).json({ error: 'unauthorized' });
+    const state = await getState(u.id);
+    res.json({ state: state || {} });
+  } catch (e) {
+    console.error('[state:get]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
 });
 
 app.put('/api/state', async (req, res) => {
-  const u = await resolveUser(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
-  const { state } = req.body || {};
-  if (!state || typeof state !== 'object') return res.status(400).json({ error: 'bad_state' });
-  await saveState(u.id, state);
-  res.json({ ok: true });
+  try {
+    const u = await resolveUser(req);
+    if (!u) return res.status(401).json({ error: 'unauthorized' });
+    const { state } = req.body || {};
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      return res.status(400).json({ error: 'bad_state' });
+    }
+    await saveState(u.id, state);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[state:put]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
 });
 
 app.post('/api/coach', async (req, res) => {
   const u = await resolveUser(req);
   if (!u) {
-    console.warn('[coach] unauthorized: initDataLen=' + String((req.body || {}).initData || '').length + ' hasToken=' + !!tokenFrom(req));
+    console.warn('[coach] unauthorized: hasToken=' + !!tokenFrom(req));
     return res.status(401).json({ error: 'unauthorized' });
   }
 
-  const rec = await getUser(u.id);
-  const plan = rec?.plan || 'free';
-  const used = Number(rec?.coach_used || 0);
-  if (plan !== 'pro' && used >= FREE_COACH_LIMIT) {
-    return res.status(402).json({ error: 'limit_reached', used, limit: FREE_COACH_LIMIT });
+  // Reserve the request atomically BEFORE calling the AI, refund on failure.
+  let reservation;
+  try {
+    reservation = await reserveCoach(u.id, FREE_COACH_LIMIT);
+  } catch (e) {
+    console.error('[coach] reserve', e.message);
+    return res.status(500).json({ error: 'server_error' });
+  }
+  if (!reservation.ok) {
+    return res.status(402).json({ error: 'limit_reached', used: reservation.used, limit: FREE_COACH_LIMIT });
   }
 
   try {
@@ -247,18 +250,18 @@ app.post('/api/coach', async (req, res) => {
       state,
       user: u,
     });
-    if (plan !== 'pro') await bumpCoach(u.id);
     res.json({ reply });
   } catch (e) {
+    if (reservation.counted) await refundCoach(u.id).catch(() => {});
     console.error('[coach]', e.message);
-    res.status(500).json({ error: 'ai_failed', detail: e.message });
+    res.status(500).json({ error: 'ai_failed' });
   }
 });
 
 /* Admin: grant or revoke Pro. */
 app.post('/api/admin/plan', async (req, res) => {
   const secret = req.headers['x-admin-secret'] || '';
-  if (!process.env.ADMIN_SECRET || secret !== process.env.ADMIN_SECRET) {
+  if (!process.env.ADMIN_SECRET || !safeEqual(secret, process.env.ADMIN_SECRET)) {
     return res.status(403).json({ error: 'forbidden' });
   }
   const { telegram_id, plan } = req.body || {};
@@ -269,9 +272,18 @@ app.post('/api/admin/plan', async (req, res) => {
   res.json({ ok: true, telegram_id: String(telegram_id), plan });
 });
 
+// Malformed JSON, oversized body etc.
+app.use((err, req, res, next) => {
+  console.warn('[http]', err.message);
+  res.status(err.status || 400).json({ error: 'bad_request' });
+});
+
 const PORT = Number(process.env.PORT || 3000);
 init()
   .then(() => {
+    if (!BOT_TOKEN) console.warn('[auth] BOT_TOKEN not set: initData is NOT verified (dev mode)');
+    if (ALLOW_UNVERIFIED) console.warn('[auth] ALLOW_UNVERIFIED=1: signature checks can be bypassed, disable it in production');
+    if (!process.env.TG_WEBHOOK_SECRET) console.warn('[tg] TG_WEBHOOK_SECRET not set: webhook accepts requests from anyone');
     app.listen(PORT, '0.0.0.0', () => console.log(`[gymai] listening on ${PORT}`));
   })
   .catch((e) => {

@@ -46,6 +46,11 @@ CREATE TABLE IF NOT EXISTS account_sessions (
   created_at  TEXT DEFAULT (datetime('now')),
   expires_at  TEXT
 );
+CREATE TABLE IF NOT EXISTS state_migrations (
+  from_owner TEXT PRIMARY KEY,
+  to_owner   TEXT NOT NULL,
+  created_at TEXT DEFAULT (datetime('now'))
+);
 CREATE INDEX IF NOT EXISTS idx_accounts_tg ON accounts(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_acct_sess_email ON account_sessions(email);
 `;
@@ -456,12 +461,56 @@ export async function mergeStateByOwner(owner, patch) {
 /* Copy state from one owner to another (device -> account migration).
    Keys already present in the target win, so an account is never
    overwritten by an older copy of the device state. */
+/* Deep merge of two state objects. The destination (the account) wins on
+   plain-value conflicts, device-only keys are added, and arrays are unioned
+   instead of one replacing the other - losing a training session because the
+   same key existed on two devices would be the worst possible outcome. */
+export function mergeStatesDeep(src, dst) {
+  const out = { ...(dst || {}) };
+  for (const k of Object.keys(src || {})) {
+    const a = src[k], b = out[k];
+    if (b === undefined) { out[k] = a; continue; }
+    if (Array.isArray(a) && Array.isArray(b)) {
+      const seen = new Set(b.map((x) => JSON.stringify(x)));
+      const extra = a.filter((x) => !seen.has(JSON.stringify(x)));
+      out[k] = [...b, ...extra];
+      continue;
+    }
+    const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+    if (isObj(a) && isObj(b)) { out[k] = mergeStatesDeep(a, b); continue; }
+    /* destination wins */
+  }
+  return out;
+}
+
+/* One-time move of a device's state into the account. Recorded in
+   state_migrations so it never runs twice for the same device - otherwise the
+   account could keep being overwritten by stale device data. */
 export async function migrateState(from, to) {
   const f = String(from), t = String(to);
-  if (!f || !t || f === t) return;
+  if (!f || !t || f === t) return false;
+  if (useFile) {
+    const db = readFile();
+    db.__migrations = db.__migrations || {};
+    if (db.__migrations[f]) return false;
+    db.__migrations[f] = t;
+  } else {
+    const seen = await client.execute({
+      sql: 'SELECT to_owner FROM state_migrations WHERE from_owner = ?',
+      args: [f],
+    });
+    if (seen.rows && seen.rows.length) return false;
+  }
   const src = await getStateByOwner(f);
-  if (!src) return;
+  if (!src) return false;
   const dst = await getStateByOwner(t) || {};
-  const merged = { ...src, ...dst };
+  const merged = mergeStatesDeep(src, dst);
   await saveStateByOwner(t, merged);
+  if (!useFile) {
+    await client.execute({
+      sql: `INSERT OR REPLACE INTO state_migrations (from_owner, to_owner, created_at) VALUES (?, ?, datetime('now'))`,
+      args: [f, t],
+    });
+  }
+  return true;
 }

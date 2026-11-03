@@ -1,6 +1,7 @@
 import { createClient } from '@libsql/client';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 /* Storage adapter.
    Primary: Turso / libSQL (works from Render, survives restarts).
@@ -24,6 +25,23 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TEXT DEFAULT (datetime('now')),
   updated_at TEXT DEFAULT (datetime('now'))
 );
+CREATE TABLE IF NOT EXISTS accounts (
+  email       TEXT PRIMARY KEY,
+  pw_hash     TEXT NOT NULL,
+  pw_salt     TEXT NOT NULL,
+  telegram_id TEXT,
+  created_at  TEXT DEFAULT (datetime('now')),
+  updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS account_sessions (
+  token       TEXT PRIMARY KEY,
+  email       TEXT NOT NULL,
+  telegram_id TEXT,
+  created_at  TEXT DEFAULT (datetime('now')),
+  expires_at  TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_tg ON accounts(telegram_id);
+CREATE INDEX IF NOT EXISTS idx_acct_sess_email ON account_sessions(email);
 `;
 
 const COLS = ['username', 'first_name', 'lang', 'plan', 'coach_used', 'state'];
@@ -101,6 +119,38 @@ export async function saveState(id, state) {
   await upsertUser(id, { state: JSON.stringify(state ?? {}) });
 }
 
+/* Merge a patch into the stored state instead of replacing it.
+   The frontend pushes ONE key at a time (debounced), so a full replace wiped
+   every other key on the server. json_set does the merge inside a single
+   UPDATE, so two devices writing different keys cannot lose each other. */
+const SAFE_KEY = /^[A-Za-z0-9_]+$/;
+
+export async function mergeState(id, patch) {
+  const keys = Object.keys(patch || {}).filter(
+    (k) => SAFE_KEY.test(k) && patch[k] !== undefined && patch[k] !== null,
+  );
+  if (!keys.length) return;
+  if (!useFile) {
+    const sets = keys.map((k) => `'$."${k}"', json(?)`).join(', ');
+    const args = keys.map((k) => JSON.stringify(patch[k]));
+    await client.execute({
+      sql: `UPDATE users SET state = json_set(COALESCE(state, '{}'), ${sets}), updated_at = datetime('now')
+            WHERE telegram_id = ?`,
+      args: [...args, String(id)],
+    });
+    return;
+  }
+  const db = readFile();
+  const rec = db[String(id)] || { telegram_id: String(id) };
+  let cur = {};
+  try { cur = JSON.parse(rec.state || '{}'); } catch (e) { cur = {}; }
+  for (const k of keys) cur[k] = patch[k];
+  rec.state = JSON.stringify(cur);
+  rec.updated_at = new Date().toISOString();
+  db[String(id)] = rec;
+  writeFile(db);
+}
+
 export async function setPlan(id, plan) {
   await upsertUser(id, { plan });
 }
@@ -176,4 +226,138 @@ export async function getSession(token) {
   }
   const db = readFile();
   return (db.__sessions || {})[String(token)] || null;
+}
+
+
+/* ---------- accounts: email + password, hashed server-side ---------- */
+
+export function hashPassword(password, salt) {
+  const s = salt || crypto.randomBytes(16).toString('hex');
+  const h = crypto.scryptSync(String(password), s, 64).toString('hex');
+  return { hash: h, salt: s };
+}
+
+export function verifyPassword(password, hash, salt) {
+  try {
+    const h = crypto.scryptSync(String(password), String(salt), 64).toString('hex');
+    const a = Buffer.from(h, 'hex');
+    const b = Buffer.from(String(hash), 'hex');
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) { return false; }
+}
+
+export async function getAccountByEmail(email) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!e) return null;
+  if (!useFile) {
+    const r = await client.execute({ sql: 'SELECT * FROM accounts WHERE email = ?', args: [e] });
+    return r.rows[0] || null;
+  }
+  const db = readFile();
+  return (db.__accounts || {})[e] || null;
+}
+
+export async function getAccountByTelegram(telegramId) {
+  const id = String(telegramId || '');
+  if (!id) return null;
+  if (!useFile) {
+    const r = await client.execute({ sql: 'SELECT * FROM accounts WHERE telegram_id = ?', args: [id] });
+    return r.rows[0] || null;
+  }
+  const db = readFile();
+  const accs = db.__accounts || {};
+  for (const k in accs) if (String(accs[k].telegram_id) === id) return accs[k];
+  return null;
+}
+
+export async function createAccount(email, password, telegramId) {
+  const e = String(email || '').trim().toLowerCase();
+  const { hash, salt } = hashPassword(password);
+  if (!useFile) {
+    await client.execute({
+      sql: `INSERT INTO accounts (email, pw_hash, pw_salt, telegram_id) VALUES (?, ?, ?, ?)
+            ON CONFLICT(email) DO UPDATE SET
+              pw_hash = excluded.pw_hash, pw_salt = excluded.pw_salt,
+              telegram_id = COALESCE(excluded.telegram_id, accounts.telegram_id),
+              updated_at = datetime('now')`,
+      args: [e, hash, salt, telegramId ? String(telegramId) : null],
+    });
+  } else {
+    const db = readFile();
+    db.__accounts = db.__accounts || {};
+    const prev = db.__accounts[e] || {};
+    db.__accounts[e] = {
+      email: e, pw_hash: hash, pw_salt: salt,
+      telegram_id: telegramId ? String(telegramId) : (prev.telegram_id || null),
+      created_at: prev.created_at || new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+    writeFile(db);
+  }
+  return getAccountByEmail(e);
+}
+
+export async function linkAccountToTelegram(email, telegramId) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!useFile) {
+    await client.execute({
+      sql: "UPDATE accounts SET telegram_id = ?, updated_at = datetime('now') WHERE email = ?",
+      args: [String(telegramId), e],
+    });
+    return;
+  }
+  const db = readFile();
+  db.__accounts = db.__accounts || {};
+  if (db.__accounts[e]) {
+    db.__accounts[e].telegram_id = String(telegramId);
+    db.__accounts[e].updated_at = new Date().toISOString();
+  }
+  writeFile(db);
+}
+
+export async function saveAccountSession(token, email, telegramId, expiresAt) {
+  const e = String(email || '').trim().toLowerCase();
+  if (!useFile) {
+    await client.execute({
+      sql: 'INSERT OR REPLACE INTO account_sessions (token, email, telegram_id, expires_at) VALUES (?, ?, ?, ?)',
+      args: [token, e, telegramId ? String(telegramId) : null, expiresAt || null],
+    });
+    return;
+  }
+  const db = readFile();
+  db.__acctSessions = db.__acctSessions || {};
+  db.__acctSessions[token] = { email: e, telegram_id: telegramId || null, expires_at: expiresAt || null };
+  writeFile(db);
+}
+
+export async function getAccountSession(token) {
+  const t = String(token || '');
+  if (!t) return null;
+  if (!useFile) {
+    const r = await client.execute({ sql: 'SELECT * FROM account_sessions WHERE token = ?', args: [t] });
+    const row = r.rows[0];
+    if (!row) return null;
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) {
+      await deleteAccountSession(t);
+      return null;
+    }
+    return row;
+  }
+  const db = readFile();
+  const s = (db.__acctSessions || {})[t];
+  if (!s) return null;
+  if (s.expires_at && new Date(s.expires_at).getTime() < Date.now()) {
+    delete db.__acctSessions[t]; writeFile(db); return null;
+  }
+  return s;
+}
+
+export async function deleteAccountSession(token) {
+  const t = String(token || '');
+  if (!useFile) {
+    await client.execute({ sql: 'DELETE FROM account_sessions WHERE token = ?', args: [t] });
+    return;
+  }
+  const db = readFile();
+  if (db.__acctSessions && db.__acctSessions[t]) { delete db.__acctSessions[t]; writeFile(db); }
 }

@@ -7,6 +7,7 @@ import {
   hashPassword, verifyPassword, getAccountByEmail, getAccountByTelegram,
   createAccount, linkAccountToTelegram,
   saveAccountSession, getAccountSession, deleteAccountSession,
+  getStateByOwner, saveStateByOwner, mergeStateByOwner, migrateState,
 } from './src/db.js';
 import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
@@ -197,11 +198,42 @@ app.post('/api/auth', async (req, res) => {
   }
 });
 
+/* Resolve who owns the data.
+   Priority:
+     1) an account token (acct_...) -> owner 'acct:<email>'  (follows the user
+        across devices — this is what makes a device change keep the data);
+     2) otherwise the Telegram session -> owner 'tg:<telegram_id>'.
+   When an account signs in on a device that already has data, the device's
+   state is migrated into the account once, so nothing is lost. */
+async function resolveOwner(req) {
+  const t = tokenFrom(req);
+  if (t && t.startsWith('acct_')) {
+    const s = await getAccountSession(t);
+    if (s) {
+      const acc = await getAccountByEmail(s.email);
+      if (acc) return { owner: 'acct:' + String(s.email).toLowerCase(), account: acc, token: t };
+    }
+  }
+  const u = await resolveUser(req);
+  if (!u) return null;
+  const tgOwner = 'tg:' + String(u.id);
+  const acc = await getAccountByTelegram(u.id);
+  if (acc) {
+    const owner = 'acct:' + String(acc.email).toLowerCase();
+    try {
+      const has = await getStateByOwner(owner);
+      if (!has) await migrateState(tgOwner, owner);
+    } catch (e) { console.warn('[owner] migration failed:', e.message); }
+    return { owner, account: acc, token: null, telegramId: String(u.id) };
+  }
+  return { owner: tgOwner, account: null, token: null, telegramId: String(u.id) };
+}
+
 app.get('/api/state', async (req, res) => {
   try {
-    const u = await resolveUser(req);
-    if (!u) return res.status(401).json({ error: 'unauthorized' });
-    const state = await getState(u.id);
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
+    const state = await getStateByOwner(o.owner);
     res.json({ state: state || {} });
   } catch (e) {
     console.error('[state:get]', e.message);
@@ -211,14 +243,14 @@ app.get('/api/state', async (req, res) => {
 
 app.put('/api/state', async (req, res) => {
   try {
-    const u = await resolveUser(req);
-    if (!u) return res.status(401).json({ error: 'unauthorized' });
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
     const { state } = req.body || {};
     if (!state || typeof state !== 'object' || Array.isArray(state)) {
       return res.status(400).json({ error: 'bad_state' });
     }
     /* Merge, don't replace: the client pushes one key at a time. */
-    await mergeState(u.id, state);
+    await mergeStateByOwner(o.owner, state);
     res.json({ ok: true });
   } catch (e) {
     console.error('[state:put]', e.message);
@@ -229,13 +261,13 @@ app.put('/api/state', async (req, res) => {
 /* Full replace — used by "reset my data", never by the normal sync path. */
 app.put('/api/state/replace', async (req, res) => {
   try {
-    const u = await resolveUser(req);
-    if (!u) return res.status(401).json({ error: 'unauthorized' });
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
     const { state } = req.body || {};
     if (!state || typeof state !== 'object' || Array.isArray(state)) {
       return res.status(400).json({ error: 'bad_state' });
     }
-    await saveState(u.id, state);
+    await saveStateByOwner(o.owner, state);
     res.json({ ok: true });
   } catch (e) {
     console.error('[state:replace]', e.message);
@@ -370,7 +402,11 @@ app.post('/api/coach', async (req, res) => {
   }
 
   try {
-    const state = await getState(u.id);
+    let state = null;
+    try {
+      const o = await resolveOwner(req);
+      state = o ? await getStateByOwner(o.owner) : null;
+    } catch (e) { state = null; }
     const reply = await askCoach({
       message: req.body?.message,
       lang: req.body?.lang || u.lang || 'ru',

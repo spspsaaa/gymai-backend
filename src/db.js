@@ -425,13 +425,22 @@ export async function mergeStateByOwner(owner, patch) {
   );
   if (!o || !keys.length) return;
   if (!useFile) {
+    /* Two separate statements on purpose. A single INSERT .. ON CONFLICT DO
+       UPDATE that repeats the json_set() list needs every placeholder bound
+       twice, which broke the binding count and made every write fail with a
+       500. Ensure the row exists, then merge the keys into it. */
     const sets = keys.map((k) => `'$."${k}"', json(?)`).join(', ');
     const args = keys.map((k) => JSON.stringify(patch[k]));
     await client.execute({
-      sql: `INSERT INTO states (owner, state, updated_at) VALUES (?, json_set('{}', ${sets}), datetime('now'))
-            ON CONFLICT(owner) DO UPDATE SET
-              state = json_set(COALESCE(states.state, '{}'), ${sets}), updated_at = datetime('now')`,
-      args: [o, ...args],
+      sql: `INSERT OR IGNORE INTO states (owner, state, updated_at)
+            VALUES (?, json_set('{}'), datetime('now'))`,
+      args: [o],
+    });
+    await client.execute({
+      sql: `UPDATE states
+            SET state = json_set(COALESCE(state, '{}'), ${sets}), updated_at = datetime('now')
+            WHERE owner = ?`,
+      args: [...args, o],
     });
     return;
   }

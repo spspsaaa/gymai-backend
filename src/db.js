@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `;
 
+const COLS = ['username', 'first_name', 'lang', 'plan', 'coach_used', 'state'];
+
 let client = null;
 let useFile = false;
 const FILE = path.join(process.cwd(), 'data', 'gymai.json');
@@ -33,7 +35,6 @@ const FILE = path.join(process.cwd(), 'data', 'gymai.json');
 function ensureDir() {
   try { fs.mkdirSync(path.dirname(FILE), { recursive: true }); } catch (e) {}
 }
-
 function readFile() {
   try { return JSON.parse(fs.readFileSync(FILE, 'utf8')); } catch (e) { return {}; }
 }
@@ -68,31 +69,25 @@ export async function getUser(id) {
   return db[String(id)] || null;
 }
 
-export async function upsertUser(id, patch) {
+/* True upsert-patch: only the fields present in `patch` are written,
+   everything else is left untouched (no read-modify-write races). */
+export async function upsertUser(id, patch = {}) {
+  const keys = COLS.filter((k) => patch[k] !== undefined);
   if (!useFile) {
+    const cols = ['telegram_id', ...keys];
+    const marks = cols.map(() => '?').join(', ');
+    const sets = keys.map((k) => `${k}=excluded.${k}`).concat(["updated_at=datetime('now')"]).join(', ');
     await client.execute({
-      sql: `INSERT INTO users (telegram_id, username, first_name, lang, plan, coach_used, state)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-              username=excluded.username, first_name=excluded.first_name,
-              lang=excluded.lang, plan=excluded.plan,
-              coach_used=excluded.coach_used, state=excluded.state,
-              updated_at=datetime('now')`,
-      args: [
-        String(id),
-        patch.username ?? null,
-        patch.first_name ?? null,
-        patch.lang ?? null,
-        patch.plan ?? 'free',
-        patch.coach_used ?? 0,
-        patch.state ?? null,
-      ],
+      sql: `INSERT INTO users (${cols.join(', ')}) VALUES (${marks})
+            ON CONFLICT(telegram_id) DO UPDATE SET ${sets}`,
+      args: [String(id), ...keys.map((k) => patch[k])],
     });
     return;
   }
   const db = readFile();
-  const prev = db[String(id)] || {};
-  db[String(id)] = { ...prev, ...patch, telegram_id: String(id) };
+  const picked = {};
+  for (const k of keys) picked[k] = patch[k];
+  db[String(id)] = { plan: 'free', coach_used: 0, ...(db[String(id)] || {}), ...picked, telegram_id: String(id) };
   writeFile(db);
 }
 
@@ -103,41 +98,56 @@ export async function getState(id) {
 }
 
 export async function saveState(id, state) {
-  const u = await getUser(id);
-  await upsertUser(id, {
-    username: u?.username ?? null,
-    first_name: u?.first_name ?? null,
-    lang: u?.lang ?? null,
-    plan: u?.plan ?? 'free',
-    coach_used: u?.coach_used ?? 0,
-    state: JSON.stringify(state ?? {}),
-  });
+  await upsertUser(id, { state: JSON.stringify(state ?? {}) });
 }
 
 export async function setPlan(id, plan) {
-  const u = await getUser(id);
-  await upsertUser(id, {
-    username: u?.username ?? null,
-    first_name: u?.first_name ?? null,
-    lang: u?.lang ?? null,
-    plan,
-    coach_used: u?.coach_used ?? 0,
-    state: u?.state ?? null,
-  });
+  await upsertUser(id, { plan });
 }
 
-export async function bumpCoach(id) {
-  const u = await getUser(id);
-  const used = Number(u?.coach_used || 0) + 1;
-  await upsertUser(id, {
-    username: u?.username ?? null,
-    first_name: u?.first_name ?? null,
-    lang: u?.lang ?? null,
-    plan: u?.plan ?? 'free',
-    coach_used: used,
-    state: u?.state ?? null,
-  });
-  return used;
+/* Atomically reserve one AI-coach request for a free user.
+   Returns { ok, counted, used }. Pro users are never counted.
+   If the AI call fails afterwards, call refundCoach(). */
+export async function reserveCoach(id, limit) {
+  let u = await getUser(id);
+  if (!u) {
+    await upsertUser(id, { plan: 'free', coach_used: 0 });
+    u = await getUser(id);
+  }
+  if (u && u.plan === 'pro') return { ok: true, counted: false, used: Number(u.coach_used || 0) };
+
+  if (!useFile) {
+    const r = await client.execute({
+      sql: `UPDATE users SET coach_used = COALESCE(coach_used, 0) + 1, updated_at = datetime('now')
+            WHERE telegram_id = ? AND COALESCE(coach_used, 0) < ?`,
+      args: [String(id), Number(limit)],
+    });
+    const used = Number(u?.coach_used || 0);
+    if (!r.rowsAffected) return { ok: false, counted: false, used };
+    return { ok: true, counted: true, used: used + 1 };
+  }
+  const db = readFile();
+  const rec = db[String(id)] || {};
+  const used = Number(rec.coach_used || 0);
+  if (used >= Number(limit)) return { ok: false, counted: false, used };
+  db[String(id)] = { ...rec, coach_used: used + 1, telegram_id: String(id) };
+  writeFile(db);
+  return { ok: true, counted: true, used: used + 1 };
+}
+
+export async function refundCoach(id) {
+  if (!useFile) {
+    await client.execute({
+      sql: `UPDATE users SET coach_used = MAX(COALESCE(coach_used, 0) - 1, 0) WHERE telegram_id = ?`,
+      args: [String(id)],
+    });
+    return;
+  }
+  const db = readFile();
+  const rec = db[String(id)];
+  if (!rec) return;
+  rec.coach_used = Math.max(Number(rec.coach_used || 0) - 1, 0);
+  writeFile(db);
 }
 
 /* ---- persistent sessions (survive Render restarts / free-plan sleeps) ---- */
@@ -165,6 +175,5 @@ export async function getSession(token) {
     try { return JSON.parse(r.rows[0].user_json); } catch (e) { return null; }
   }
   const db = readFile();
-  const u = (db.__sessions || {})[String(token)];
-  return u || null;
+  return (db.__sessions || {})[String(token)] || null;
 }

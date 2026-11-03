@@ -14,7 +14,21 @@ export async function askCoach({ message, lang = 'ru', history = [], state = nul
   if (!key) throw new Error('AI_API_KEY is not set');
 
   const base = (process.env.AI_BASE || 'https://api.openai.com/v1').replace(/\/$/, '');
-  const model = process.env.AI_MODEL || 'gpt-4o-mini';
+  // Model candidates. Free-tier models on OpenRouter are frequently
+  // rate-limited, so we try the configured model first and then fall back
+  // through known-good alternatives instead of failing the whole request.
+  const MODEL_FALLBACKS = [
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'liquid/lfm-2.5-2.6b:free',
+    'nvidia/nemotron-3.5-lightning:free',
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'openrouter/free',
+  ];
+  const configured = process.env.AI_MODEL;
+  const models = configured
+    ? [configured, ...MODEL_FALLBACKS.filter((m) => m !== configured)]
+    : MODEL_FALLBACKS;
+  const model = models[0];
 
   const msgs = [
     { role: 'system', content: lang === 'en' ? SYSTEM_EN : SYSTEM_RU },
@@ -41,32 +55,56 @@ export async function askCoach({ message, lang = 'ru', history = [], state = nul
   }
   msgs.push({ role: 'user', content: String(message || '').slice(0, 4000) });
 
-  const r = await fetch(`${base}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${key}`,
-    },
-    body: JSON.stringify({
-      model,
-      messages: msgs,
-      temperature: 0.7,
-      max_tokens: 1400,
-    }),
-  });
+  let lastError = null;
 
-  if (!r.ok) {
-    const t = await r.text().catch(() => '');
-    throw new Error(`AI ${r.status}: ${t.slice(0, 300)}`);
+  for (const m of models) {
+    let r;
+    try {
+      r = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${key}`,
+        },
+        body: JSON.stringify({
+          model: m,
+          messages: msgs,
+          temperature: 0.7,
+          max_tokens: 1400,
+        }),
+      });
+    } catch (e) {
+      lastError = new Error(`AI network error on ${m}: ${String(e).slice(0, 200)}`);
+      continue;
+    }
+
+    if (!r.ok) {
+      const body = await r.text().catch(() => '');
+      lastError = new Error(`AI ${r.status} on ${m}: ${body.slice(0, 300)}`);
+      // 429 = model rate-limited upstream -> try the next candidate.
+      // 404 = model no longer available -> try the next candidate.
+      if (r.status === 429 || r.status === 404 || r.status === 503) {
+        console.warn(`[ai] ${m} -> ${r.status}, trying next model`);
+        continue;
+      }
+      throw lastError;
+    }
+
+    const j = await r.json();
+    const msg = j?.choices?.[0]?.message || {};
+    let reply = (msg.content || '').trim();
+    if (!reply) {
+      // Reasoning models may burn max_tokens on reasoning and leave content empty.
+      const rsn = (msg.reasoning || '').trim();
+      if (rsn) reply = rsn;
+    }
+    if (!reply) {
+      lastError = new Error(`Empty AI reply from ${m}`);
+      continue;
+    }
+    console.log(`[ai] answered by ${m}`);
+    return reply;
   }
-  const j = await r.json();
-  const msg = j?.choices?.[0]?.message || {};
-  let reply = (msg.content || '').trim();
-  if (!reply) {
-    // Reasoning models may burn max_tokens on reasoning and leave content empty.
-    const rsn = (msg.reasoning || '').trim();
-    if (rsn) reply = rsn;
-  }
-  if (!reply) throw new Error('Empty AI reply');
-  return reply;
+
+  throw lastError || new Error('AI: no model available');
 }

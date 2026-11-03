@@ -76,3 +76,24 @@ export function verifyInitData(initData, botToken) {
     return null;
   }
 }
+
+/* Extract the user payload from initData WITHOUT checking the signature.
+   Only used when the server explicitly enables ALLOW_UNVERIFIED=1
+   (e.g. initData issued before a bot-token rotation). */
+export function userFromInitDataUnverified(initData) {
+  const raw = parseInitData(initData);
+  if (!raw || !raw.user) return null;
+  try {
+    const u = JSON.parse(raw.user);
+    if (!u || !u.id) return null;
+    return {
+      id: String(u.id),
+      username: u.username || '',
+      first_name: u.first_name || '',
+      last_name: u.last_name || '',
+      lang: raw.language_code || '',
+    };
+  } catch (e) {
+    return null;
+  }
+}

@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
 import { init, getUser, saveState, setPlan, bumpCoach, getState, saveSession, getSession } from './src/db.js';
-import { verifyInitData } from './src/telegram.js';
+import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
 
 const app = express();
@@ -11,6 +11,24 @@ app.use(express.json({ limit: '2mb' }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const FREE_COACH_LIMIT = Number(process.env.FREE_COACH_LIMIT || 20);
+
+
+/* Resolve a user from initData.
+   Verified HMAC signature first. If it fails and ALLOW_UNVERIFIED=1 is set,
+   fall back to the initData payload (needed when initData was issued by a
+   different/older bot token and can no longer be signature-verified). */
+function resolveInitUser(initData) {
+  const v = verifyInitData(initData, BOT_TOKEN);
+  if (v && v.id) return { user: v, verified: true };
+  if (process.env.ALLOW_UNVERIFIED === '1') {
+    const u = userFromInitDataUnverified(initData);
+    if (u) {
+      console.warn('[auth] initData accepted WITHOUT signature verification (ALLOW_UNVERIFIED=1) id=' + u.id);
+      return { user: u, verified: false };
+    }
+  }
+  return { user: null, verified: false };
+}
 
 const sessions = new Map(); // token -> telegram user
 
@@ -43,8 +61,8 @@ async function resolveUser(req) {
     console.warn('[auth] no initData and no valid token');
     return null;
   }
-  const verified = verifyInitData(initData, BOT_TOKEN);
-  if (verified && verified.id) return verified;
+  const ru = resolveInitUser(initData);
+  if (ru.user) return ru.user;
   console.warn('[auth] verifyInitData failed, len=' + String(initData).length);
 
   // No BOT_TOKEN configured (local dev) - trust initData payload.
@@ -97,7 +115,7 @@ app.get('/health', async (req, res) => {
 
 app.post('/api/auth', async (req, res) => {
   const { initData = '' } = req.body || {};
-  let u = verifyInitData(initData, BOT_TOKEN);
+  let u = resolveInitUser(initData).user;
   if (!u && !BOT_TOKEN) {
     const { parseInitData } = await import('./src/telegram.js');
     const raw = parseInitData(initData);

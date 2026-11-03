@@ -34,7 +34,7 @@ import { upsertUser as _upsertUser } from './src/db.js';
 
 
 /* ---- Telegram bot: reply with an inline button that opens the mini app ---- */
-const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky-3f0d63ky-3f0d63ky.agent.mira.tg';
+const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky-3f0d63ky.agent.mira.tg';
 
 async function telegramCall(method, payload) {
   if (!BOT_TOKEN) return null;

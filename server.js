@@ -15,7 +15,7 @@ app.use(express.json({ limit: '2mb' }));
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const FREE_COACH_LIMIT = Number(process.env.FREE_COACH_LIMIT || 20);
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED === '1';
-const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky-3f0d63ky.agent.mira.tg';
+const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky.agent.mira.tg';
 
 function safeEqual(a, b) {
   const x = Buffer.from(String(a));

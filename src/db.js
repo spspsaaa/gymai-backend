@@ -7,6 +7,12 @@ import path from 'node:path';
    Fallback: local JSON file (so the backend still runs with zero config). */
 
 const SCHEMA = `
+CREATE TABLE IF NOT EXISTS sessions (
+  token       TEXT PRIMARY KEY,
+  telegram_id TEXT,
+  user_json   TEXT,
+  created_at  TEXT DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS users (
   telegram_id TEXT PRIMARY KEY,
   username   TEXT,
@@ -132,4 +138,33 @@ export async function bumpCoach(id) {
     state: u?.state ?? null,
   });
   return used;
+}
+
+/* ---- persistent sessions (survive Render restarts / free-plan sleeps) ---- */
+export async function saveSession(token, user) {
+  if (!useFile) {
+    await client.execute({
+      sql: 'INSERT OR REPLACE INTO sessions (token, telegram_id, user_json) VALUES (?, ?, ?)',
+      args: [token, String(user.id), JSON.stringify(user)],
+    });
+    return;
+  }
+  const db = readFile();
+  db.__sessions = db.__sessions || {};
+  db.__sessions[token] = user;
+  writeFile(db);
+}
+
+export async function getSession(token) {
+  if (!useFile) {
+    const r = await client.execute({
+      sql: 'SELECT user_json FROM sessions WHERE token = ?',
+      args: [String(token)],
+    });
+    if (!r.rows[0]) return null;
+    try { return JSON.parse(r.rows[0].user_json); } catch (e) { return null; }
+  }
+  const db = readFile();
+  const u = (db.__sessions || {})[String(token)];
+  return u || null;
 }

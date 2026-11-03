@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
-import { init, getUser, saveState, setPlan, bumpCoach, getState } from './src/db.js';
+import { init, getUser, saveState, setPlan, bumpCoach, getState, saveSession, getSession } from './src/db.js';
 import { verifyInitData } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
 
@@ -18,22 +18,34 @@ function newToken() {
   return crypto.randomBytes(24).toString('hex');
 }
 
-function userFromToken(req) {
+function tokenFrom(req) {
   const h = req.headers.authorization || '';
-  const t = h.startsWith('Bearer ') ? h.slice(7) : '';
+  return h.startsWith('Bearer ') ? h.slice(7) : '';
+}
+
+async function userFromToken(req) {
+  const t = tokenFrom(req);
   if (!t) return null;
-  return sessions.get(t) || null;
+  if (sessions.has(t)) return sessions.get(t);
+  const u = await getSession(t);
+  if (u) sessions.set(t, u);
+  return u || null;
 }
 
 /* Resolve the user: Bearer token first, then initData as fallback. */
 async function resolveUser(req) {
-  const u = userFromToken(req);
+  const u = await userFromToken(req);
   if (u) return u;
 
   const body = req.body || {};
   const initData = body.initData || (req.headers['x-init-data'] || '');
+  if (!initData) {
+    console.warn('[auth] no initData and no valid token');
+    return null;
+  }
   const verified = verifyInitData(initData, BOT_TOKEN);
   if (verified && verified.id) return verified;
+  console.warn('[auth] verifyInitData failed, len=' + String(initData).length);
 
   // No BOT_TOKEN configured (local dev) - trust initData payload.
   if (!BOT_TOKEN && initData) {
@@ -90,6 +102,7 @@ app.post('/api/auth', async (req, res) => {
 
   const token = newToken();
   sessions.set(token, u);
+  await saveSession(token, u);
   res.json({
     token,
     user: {
@@ -121,7 +134,10 @@ app.put('/api/state', async (req, res) => {
 
 app.post('/api/coach', async (req, res) => {
   const u = await resolveUser(req);
-  if (!u) return res.status(401).json({ error: 'unauthorized' });
+  if (!u) {
+    console.warn('[coach] unauthorized: initDataLen=' + String((req.body || {}).initData || '').length + ' hasToken=' + !!tokenFrom(req));
+    return res.status(401).json({ error: 'unauthorized' });
+  }
 
   const rec = await getUser(u.id);
   const plan = rec?.plan || 'free';

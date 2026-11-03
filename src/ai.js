@@ -51,7 +51,7 @@ export async function askCoach({ message, lang = 'ru', history = [], state = nul
       model,
       messages: msgs,
       temperature: 0.7,
-      max_tokens: 700,
+      max_tokens: 1400,
     }),
   });
 
@@ -60,7 +60,13 @@ export async function askCoach({ message, lang = 'ru', history = [], state = nul
     throw new Error(`AI ${r.status}: ${t.slice(0, 300)}`);
   }
   const j = await r.json();
-  const reply = j?.choices?.[0]?.message?.content || '';
+  const msg = j?.choices?.[0]?.message || {};
+  let reply = (msg.content || '').trim();
+  if (!reply) {
+    // Reasoning models may burn max_tokens on reasoning and leave content empty.
+    const rsn = (msg.reasoning || '').trim();
+    if (rsn) reply = rsn;
+  }
   if (!reply) throw new Error('Empty AI reply');
   return reply;
 }

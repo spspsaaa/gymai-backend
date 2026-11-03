@@ -29,6 +29,7 @@ function checkStringVariants(initData) {
     const rawV = pair.slice(idx + 1);
     rawPairs.push({ k, rawV, decV: safeDecode(rawV.replace(/\+/g, ' ')) });
   }
+
   const build = (useRaw, keepSignature) => {
     const map = new Map();
     for (const p of rawPairs) {
@@ -38,6 +39,7 @@ function checkStringVariants(initData) {
     }
     return [...map.keys()].sort().map((k) => `${k}=${map.get(k)}`).join('\n');
   };
+
   return [
     build(false, false), // decoded values, hash+signature excluded (canonical)
     build(true, false),  // raw values, hash+signature excluded

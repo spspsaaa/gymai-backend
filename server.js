@@ -215,11 +215,11 @@ async function resolveOwner(req) {
         const owner = 'acct:' + String(s.email).toLowerCase();
         /* The device may already hold data under 'tg:<id>' from before the
            account existed. Move it into the account once, so signing in does
-           not look like losing everything. */
+           not look like losing everything. migrateState is guarded internally
+           and merges, so calling it on every request is safe. */
         if (s.telegram_id) {
           try {
-            const has = await getStateByOwner(owner);
-            if (!has) await migrateState('tg:' + String(s.telegram_id), owner);
+            await migrateState('tg:' + String(s.telegram_id), owner);
           } catch (e) { console.warn('[owner] migration failed:', e.message); }
         }
         return { owner, account: acc, token: t, telegramId: s.telegram_id };
@@ -233,8 +233,7 @@ async function resolveOwner(req) {
   if (acc) {
     const owner = 'acct:' + String(acc.email).toLowerCase();
     try {
-      const has = await getStateByOwner(owner);
-      if (!has) await migrateState(tgOwner, owner);
+      await migrateState(tgOwner, owner);
     } catch (e) { console.warn('[owner] migration failed:', e.message); }
     return { owner, account: acc, token: null, telegramId: String(u.id) };
   }
@@ -339,16 +338,14 @@ app.post('/api/account/register', async (req, res) => {
     if (telegramId) {
       /* Data collected on this device before registration stays with the user. */
       try {
-        const has = await getStateByOwner(owner);
-        if (!has) await migrateState('tg:' + String(telegramId), owner);
+        await migrateState('tg:' + String(telegramId), owner);
       } catch (e) { console.warn('[owner] migration on register failed:', e.message); }
     }
     const ownerAcc = 'acct:' + e;
     if (telegramId) {
       /* Signing in on a device that already had local data: merge it in. */
       try {
-        const has = await getStateByOwner(ownerAcc);
-        if (!has) await migrateState('tg:' + String(telegramId), ownerAcc);
+        await migrateState('tg:' + String(telegramId), ownerAcc);
       } catch (e) { console.warn('[owner] migration on login failed:', e.message); }
     }
     const token = 'acct_' + accountToken();
@@ -380,8 +377,7 @@ app.post('/api/account/login', async (req, res) => {
     if (telegramId) {
       /* Signing in on a device that already had local data: merge it in. */
       try {
-        const has = await getStateByOwner(ownerAcc);
-        if (!has) await migrateState('tg:' + String(telegramId), ownerAcc);
+        await migrateState('tg:' + String(telegramId), ownerAcc);
       } catch (e) { console.warn('[owner] migration on login failed:', e.message); }
     }
     const token = 'acct_' + accountToken();

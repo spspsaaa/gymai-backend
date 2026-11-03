@@ -30,7 +30,13 @@ CREATE TABLE IF NOT EXISTS accounts (
   pw_hash     TEXT NOT NULL,
   pw_salt     TEXT NOT NULL,
   telegram_id TEXT,
+  plan        TEXT DEFAULT 'free',
   created_at  TEXT DEFAULT (datetime('now')),
+  updated_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS states (
+  owner       TEXT PRIMARY KEY,
+  state       TEXT,
   updated_at  TEXT DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS account_sessions (
@@ -67,6 +73,14 @@ export async function init() {
   if (url && token) {
     client = createClient({ url, authToken: token });
     await client.executeMultiple(SCHEMA);
+    try { await client.execute("ALTER TABLE accounts ADD COLUMN plan TEXT DEFAULT 'free'"); }
+    catch (e) { /* column already exists */ }
+    try {
+      await client.execute(
+        "INSERT OR IGNORE INTO states (owner, state, updated_at) " +
+        "SELECT 'tg:' || telegram_id, state, updated_at FROM users WHERE state IS NOT NULL AND state != ''",
+      );
+    } catch (e) { console.warn('[db] legacy state migration skipped:', e.message); }
     console.log('[db] libSQL connected:', url);
   } else {
     useFile = true;
@@ -360,4 +374,85 @@ export async function deleteAccountSession(token) {
   }
   const db = readFile();
   if (db.__acctSessions && db.__acctSessions[t]) { delete db.__acctSessions[t]; writeFile(db); }
+}
+
+
+/* ---------- owner-keyed state ----------
+   The owner is the identity that owns the data:
+     'tg:<telegram_id>'  -> a device that has not signed in with an email
+     'acct:<email>'      -> an account, which follows the user across devices
+   State lives in its own table so it is independent from the users rows
+   (which are keyed by telegram id). */
+
+export async function getStateByOwner(owner) {
+  const o = String(owner);
+  if (!o) return null;
+  if (!useFile) {
+    const r = await client.execute({ sql: 'SELECT state FROM states WHERE owner = ?', args: [o] });
+    const row = r.rows[0];
+    if (!row || !row.state) return null;
+    try { return JSON.parse(row.state); } catch (e) { return null; }
+  }
+  const db = readFile();
+  db.__states = db.__states || {};
+  const raw = db.__states[o];
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+export async function saveStateByOwner(owner, state) {
+  const o = String(owner);
+  if (!o) return;
+  const payload = JSON.stringify(state ?? {});
+  if (!useFile) {
+    await client.execute({
+      sql: `INSERT INTO states (owner, state, updated_at) VALUES (?, ?, datetime('now'))
+            ON CONFLICT(owner) DO UPDATE SET state = excluded.state, updated_at = datetime('now')`,
+      args: [o, payload],
+    });
+    return;
+  }
+  const db = readFile();
+  db.__states = db.__states || {};
+  db.__states[o] = payload;
+  writeFile(db);
+}
+
+export async function mergeStateByOwner(owner, patch) {
+  const o = String(owner);
+  const keys = Object.keys(patch || {}).filter(
+    (k) => SAFE_KEY.test(k) && patch[k] !== undefined && patch[k] !== null,
+  );
+  if (!o || !keys.length) return;
+  if (!useFile) {
+    const sets = keys.map((k) => `'$."${k}"', json(?)`).join(', ');
+    const args = keys.map((k) => JSON.stringify(patch[k]));
+    await client.execute({
+      sql: `INSERT INTO states (owner, state, updated_at) VALUES (?, json_set('{}', ${sets}), datetime('now'))
+            ON CONFLICT(owner) DO UPDATE SET
+              state = json_set(COALESCE(states.state, '{}'), ${sets}), updated_at = datetime('now')`,
+      args: [o, ...args],
+    });
+    return;
+  }
+  const db = readFile();
+  db.__states = db.__states || {};
+  let cur = {};
+  try { cur = JSON.parse(db.__states[o] || '{}'); } catch (e) { cur = {}; }
+  for (const k of keys) cur[k] = patch[k];
+  db.__states[o] = JSON.stringify(cur);
+  writeFile(db);
+}
+
+/* Copy state from one owner to another (device -> account migration).
+   Keys already present in the target win, so an account is never
+   overwritten by an older copy of the device state. */
+export async function migrateState(from, to) {
+  const f = String(from), t = String(to);
+  if (!f || !t || f === t) return;
+  const src = await getStateByOwner(f);
+  if (!src) return;
+  const dst = await getStateByOwner(t) || {};
+  const merged = { ...src, ...dst };
+  await saveStateByOwner(t, merged);
 }

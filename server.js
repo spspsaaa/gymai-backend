@@ -30,6 +30,80 @@ function resolveInitUser(initData) {
   return { user: null, verified: false };
 }
 
+import { upsertUser as _upsertUser } from './src/db.js';
+
+
+/* ---- Telegram bot: reply with an inline button that opens the mini app ---- */
+const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky-3f0d63ky-3f0d63ky.agent.mira.tg';
+
+async function telegramCall(method, payload) {
+  if (!BOT_TOKEN) return null;
+  try {
+    const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {}),
+    });
+    return await r.json().catch(() => null);
+  } catch (e) {
+    console.warn('[tg]', method, 'failed', String(e).slice(0, 120));
+    return null;
+  }
+}
+
+const APP_BTN = {
+  inline_keyboard: [[{ text: '\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043a\u0443', web_app: { url: WEBAPP_URL } }]],
+};
+
+async function sendWelcome(chatId) {
+  return telegramCall('sendMessage', {
+    chat_id: chatId,
+    text: '\u041f\u0440\u0438\u0432\u0435\u0442! \u042f \u0438\u0438\u0440\u043e\u0432\u043e\u0439 \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043e\u0447\u043d\u044b\u0439 \u043a\u043e\u0449. \u041e\u0442\u043a\u0440\u043e\u0439 \u043f\u043b\u0430\u043d \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043a\u0443, \u0430\u0438 \u0438\u0434\u0435\u0441\u044c \u0441\u043f\u0440\u043e\u0441\u0438 \u0442\u044b \u043f\u0438\u0448\u0438 \u0441\u043a\u0430\u0436\u0435 \u0432 \u043e\u0434\u043d\u043e\u043c \u0447\u0430\u0442\u0435.\n\n\u041d\u0430\u0436\u043c\u0438 \u043a\u043d\u043e\u043f\u043a\u0443 \u2014 \u043f\u0440\u044f\u043c\u043e \u0441\u0442\u0430\u0440\u0442 \u043e\u0431\u0443\u0447\u0435\u043d\u0438\u044f.\n\u0427\u0442\u043e \u0442\u044b \u0445\u043e\u0447\u0435\u0448\u044c \u0441\u0434\u0435\u043b\u0430\u0442\u044c:',
+    ...APP_BTN,
+    disable_web_page_preview: true,
+  });
+}
+
+app.post('/api/tg/webhook', async (req, res) => {
+  const secret = process.env.TG_WEBHOOK_SECRET || '';
+  if (secret && req.headers['x-telegram-bot-api-secret-token'] !== secret) {
+    return res.status(403).json({ error: 'forbidden' });
+  }
+  try {
+    const up = req.body || {};
+    const msg = up.message || up.edited_message;
+    if (msg && msg.chat && msg.chat.type !== 'channel') {
+      const chatId = msg.chat.id;
+      const text = String(msg.text || '').trim();
+      if (/^\/start/i.test(text)) {
+        const u = await getUser(String(msg.from && msg.from.id));
+        if (!u && msg.from) {
+          await upsertUserSafe(String(msg.from.id), {
+            username: msg.from.username || '',
+            first_name: msg.from.first_name || '',
+            lang: msg.from.language_code || '',
+          });
+        }
+        await sendWelcome(chatId);
+      } else if (text) {
+        await telegramCall('sendMessage', {
+          chat_id: chatId,
+          text: '\u041e\u0442\u043a\u0440\u043e\u0439 \u043a\u043d\u043e\u043f\u043a\u0438 \u2014 \u043e\u0442\u043a\u0440\u043e\u0435 \u043c\u0438\u043d\u0438-\u0430\u043f\u043f, \u043f\u043e\u0434\u0442\u0430\u0439\u0441\u044f \u043f\u0440\u044f\u043c\u043e\u0441\u0442\u044c \u0442\u0440\u0435\u043d\u0438\u0440\u043e\u0432\u043a\u0443.',
+          ...APP_BTN,
+        });
+      }
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn('[tg] webhook error', String(e).slice(0, 200));
+    return res.status(200).json({ ok: true });
+  }
+});
+
+async function upsertUserSafe(id, patch) {
+  try { await _upsertUser(id, patch); } catch (e) {}
+}
+
 const sessions = new Map(); // token -> telegram user
 
 function newToken() {

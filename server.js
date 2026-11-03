@@ -2,8 +2,11 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
 import {
-  init, getUser, upsertUser, saveState, setPlan, getState,
+  init, getUser, upsertUser, saveState, mergeState, setPlan, getState,
   saveSession, getSession, reserveCoach, refundCoach,
+  hashPassword, verifyPassword, getAccountByEmail, getAccountByTelegram,
+  createAccount, linkAccountToTelegram,
+  saveAccountSession, getAccountSession, deleteAccountSession,
 } from './src/db.js';
 import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
@@ -214,10 +217,135 @@ app.put('/api/state', async (req, res) => {
     if (!state || typeof state !== 'object' || Array.isArray(state)) {
       return res.status(400).json({ error: 'bad_state' });
     }
-    await saveState(u.id, state);
+    /* Merge, don't replace: the client pushes one key at a time. */
+    await mergeState(u.id, state);
     res.json({ ok: true });
   } catch (e) {
     console.error('[state:put]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* Full replace — used by "reset my data", never by the normal sync path. */
+app.put('/api/state/replace', async (req, res) => {
+  try {
+    const u = await resolveUser(req);
+    if (!u) return res.status(401).json({ error: 'unauthorized' });
+    const { state } = req.body || {};
+    if (!state || typeof state !== 'object' || Array.isArray(state)) {
+      return res.status(400).json({ error: 'bad_state' });
+    }
+    await saveState(u.id, state);
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[state:replace]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* ---------- accounts: register / login, bound to the Telegram id ---------- */
+
+const ACCOUNT_SESSION_DAYS = 90;
+
+function accountToken() {
+  return crypto.randomBytes(24).toString('hex');
+}
+
+function accountExpiry() {
+  return new Date(Date.now() + ACCOUNT_SESSION_DAYS * 86400000).toISOString();
+}
+
+/* Resolve the account from an account token (Bearer acct_...), or fall back
+   to the Telegram session so the mini app keeps working without a password. */
+async function resolveAccount(req) {
+  const t = tokenFrom(req);
+  if (t && t.startsWith('acct_')) {
+    const s = await getAccountSession(t);
+    if (s) {
+      const acc = await getAccountByEmail(s.email);
+      if (acc) return { account: acc, token: t, telegramId: s.telegram_id };
+    }
+  }
+  const u = await resolveUser(req);
+  if (!u) return null;
+  const acc = await getAccountByTelegram(u.id);
+  if (!acc) return null;
+  return { account: acc, token: null, telegramId: String(u.id) };
+}
+
+app.post('/api/account/register', async (req, res) => {
+  try {
+    const { email = '', password = '', initData = '' } = req.body || {};
+    const e = String(email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e)) {
+      return res.status(400).json({ error: 'bad_email' });
+    }
+    if (!password || String(password).length < 6) {
+      return res.status(400).json({ error: 'weak_password' });
+    }
+    const existing = await getAccountByEmail(e);
+    if (existing) return res.status(409).json({ error: 'email_taken' });
+
+    let telegramId = null;
+    const u = resolveInitUser(initData);
+    if (u && u.id) telegramId = String(u.id);
+
+    await createAccount(e, password, telegramId);
+    const token = 'acct_' + accountToken();
+    await saveAccountSession(token, e, telegramId, accountExpiry());
+    res.json({ ok: true, token, email: e });
+  } catch (e) {
+    console.error('[account:register]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/account/login', async (req, res) => {
+  try {
+    const { email = '', password = '', initData = '' } = req.body || {};
+    const e = String(email).trim().toLowerCase();
+    const acc = await getAccountByEmail(e);
+    if (!acc || !verifyPassword(password, acc.pw_hash, acc.pw_salt)) {
+      return res.status(401).json({ error: 'bad_credentials' });
+    }
+    let telegramId = acc.telegram_id;
+    const u = resolveInitUser(initData);
+    if (u && u.id) {
+      telegramId = String(u.id);
+      if (!acc.telegram_id || String(acc.telegram_id) !== telegramId) {
+        await linkAccountToTelegram(e, telegramId);
+      }
+    }
+    const token = 'acct_' + accountToken();
+    await saveAccountSession(token, e, telegramId, accountExpiry());
+    res.json({ ok: true, token, email: e, telegram_id: telegramId });
+  } catch (e) {
+    console.error('[account:login]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/api/account/me', async (req, res) => {
+  try {
+    const a = await resolveAccount(req);
+    if (!a) return res.status(401).json({ error: 'unauthorized' });
+    res.json({
+      email: a.account.email,
+      telegram_id: a.telegramId,
+      created_at: a.account.created_at,
+    });
+  } catch (e) {
+    console.error('[account:me]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/account/logout', async (req, res) => {
+  try {
+    const t = tokenFrom(req);
+    if (t && t.startsWith('acct_')) await deleteAccountSession(t);
+    res.json({ ok: true });
+  } catch (e) {
     res.status(500).json({ error: 'server_error' });
   }
 });

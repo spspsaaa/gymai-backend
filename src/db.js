@@ -810,3 +810,10 @@ export async function deleteAccount(email) {
   writeFile(db);
   return true;
 }
+
+/* Which storage is actually in use: 'turso' or 'file'. The health endpoint
+   reports it so a deployment that silently fell back to the local file is
+   visible from outside. */
+export function storageMode() {
+  return useFile ? 'file' : (client ? 'turso' : 'none');
+}

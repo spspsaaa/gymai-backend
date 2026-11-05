@@ -10,8 +10,7 @@ import {
   getStateByOwner, saveStateByOwner, mergeStateByOwner, migrateState,
   getAccountProfile, updateAccountProfile, setAccountPlan, listAccounts,
   saveAdminSession, getAdminSession, deleteAdminSession,
-  getChatHistory, appendChat, coachUsage,
-} from './src/db.js';
+  getChatHistory, appendChat, coachUsage, storageMode} from './src/db.js';
 import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
 
@@ -161,7 +160,14 @@ async function resolveUser(req) {
 }
 
 app.get('/health', (req, res) => {
-  res.json({ ok: true, ai: !!process.env.AI_API_KEY, bot: !!BOT_TOKEN });
+  res.json({
+    ok: true,
+    ai: !!process.env.AI_API_KEY,
+    bot: !!BOT_TOKEN,
+    /* 'turso' = данные в базе и переживают рестарт; 'file' = локальный
+       файл, данные пропадут при рестарте (допустимо только локально). */
+    storage: storageMode(),
+  });
 });
 
 app.post('/api/auth', async (req, res) => {

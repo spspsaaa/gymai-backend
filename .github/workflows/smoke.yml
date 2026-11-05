@@ -17,3 +17,8 @@ jobs:
         run: node scripts/smoke.js
         env:
           API_BASE: ${{ vars.API_BASE || 'https://gymai-backend-ev1z.onrender.com' }}
+      - name: Проверить базу Turso
+        run: node scripts/dbcheck.js
+        env:
+          TURSO_URL: ${{ vars.TURSO_URL }}
+          TURSO_TOKEN: ${{ secrets.TURSO_TOKEN }}

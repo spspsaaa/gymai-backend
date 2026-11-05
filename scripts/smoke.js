@@ -23,6 +23,7 @@ async function call(path, { method = 'GET', body, token } = {}) {
 
 const CASES = [
   ['health отвечает',                    '/health',                          { },                                   [200]],
+  ['health сообщает Turso, а не файл',   '/health',                          { expectStorage: 'turso' },             [200]],
   ['состояние без токена отклоняется',    '/api/state',                       { },                                   [401, 403]],
   ['профиль аккаунта без токена',         '/api/account/me',                  { },                                   [401, 403]],
   ['профиль (GET) без токена',            '/api/account/profile',             { },                                   [401, 403]],
@@ -39,7 +40,16 @@ const CASES = [
     let r;
     try { r = await call(path, opts); }
     catch (e) { console.log('❌', name, '->', e.message); failed++; continue; }
-    const ok = expect.includes(r.status);
+    let ok = expect.includes(r.status);
+    if (ok && opts.expectStorage) {
+      try {
+        const parsed = JSON.parse(r.body);
+        ok = parsed.storage === opts.expectStorage;
+        if (!ok) {
+          console.log('   ожидали storage=' + opts.expectStorage + ', получили ' + JSON.stringify(parsed.storage));
+        }
+      } catch (e) { ok = false; }
+    }
     if (!ok) failed++;
     console.log((ok ? '✅' : '❌'), name, '->', r.status, r.body);
   }

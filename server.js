@@ -8,6 +8,9 @@ import {
   createAccount, linkAccountToTelegram,
   saveAccountSession, getAccountSession, deleteAccountSession,
   getStateByOwner, saveStateByOwner, mergeStateByOwner, migrateState,
+  getAccountProfile, updateAccountProfile, setAccountPlan, listAccounts,
+  saveAdminSession, getAdminSession, deleteAdminSession,
+  getChatHistory, appendChat, coachUsage,
 } from './src/db.js';
 import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
@@ -416,18 +419,26 @@ app.post('/api/account/logout', async (req, res) => {
 
 app.post('/api/coach', async (req, res) => {
   const u = await resolveUser(req);
-  if (!u) {
+  const o = await resolveOwner(req);
+  if (!u && !o) {
     console.warn('[coach] unauthorized: hasToken=' + !!tokenFrom(req));
     return res.status(401).json({ error: 'unauthorized' });
   }
 
+  /* The tariff lives on the account now. A Pro account is never counted,
+     even if the Telegram row still says 'free'. */
+  let accountPro = false;
+  if (o && o.account && o.account.plan === 'pro') accountPro = true;
+
   // Reserve the request atomically BEFORE calling the AI, refund on failure.
-  let reservation;
-  try {
-    reservation = await reserveCoach(u.id, FREE_COACH_LIMIT);
-  } catch (e) {
-    console.error('[coach] reserve', e.message);
-    return res.status(500).json({ error: 'server_error' });
+  let reservation = { ok: true, counted: false, used: 0 };
+  if (!accountPro && u) {
+    try {
+      reservation = await reserveCoach(u.id, FREE_COACH_LIMIT);
+    } catch (e) {
+      console.error('[coach] reserve', e.message);
+      return res.status(500).json({ error: 'server_error' });
+    }
   }
   if (!reservation.ok) {
     return res.status(402).json({ error: 'limit_reached', used: reservation.used, limit: FREE_COACH_LIMIT });
@@ -436,21 +447,243 @@ app.post('/api/coach', async (req, res) => {
   try {
     let state = null;
     try {
-      const o = await resolveOwner(req);
       state = o ? await getStateByOwner(o.owner) : null;
     } catch (e) { state = null; }
+    /* The chat history is kept on the server, so it survives a reinstall and
+       follows the user to another device. The client may still send a short
+       tail; the server copy is the authoritative one. */
+    let history = [];
+    try {
+      history = o ? await getChatHistory(o.owner) : [];
+    } catch (e) { history = []; }
+    const clientHistory = Array.isArray(req.body?.history) ? req.body.history : [];
+    if (!history.length && clientHistory.length) history = clientHistory.slice(-8);
+
     const reply = await askCoach({
       message: req.body?.message,
-      lang: req.body?.lang || u.lang || 'ru',
-      history: req.body?.history || [],
+      lang: req.body?.lang || (u && u.lang) || 'ru',
+      history,
       state,
       user: u,
     });
+
+    /* Store the exchange so the conversation continues after a reinstall. */
+    try {
+      if (o) {
+        await appendChat(o.owner, [
+          { role: 'user', content: String(req.body?.message || '').slice(0, 4000), at: new Date().toISOString() },
+          { role: 'assistant', content: String(reply || '').slice(0, 4000), at: new Date().toISOString() },
+        ]);
+      }
+    } catch (e) { console.warn('[coach] history save failed', e.message); }
+
     res.json({ reply });
   } catch (e) {
     if (reservation.counted) await refundCoach(u.id).catch(() => {});
     console.error('[coach]', e.message);
     res.status(500).json({ error: 'ai_failed' });
+  }
+});
+
+
+/* ---------- account profile: the server owns it, not localStorage ---------- */
+
+app.get('/api/account/profile', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o || !o.account) return res.status(401).json({ error: 'unauthorized' });
+    const profile = await getAccountProfile(o.account.email);
+    if (!profile) return res.status(404).json({ error: 'no_account' });
+    res.json({ profile, usage: await coachUsage(profile.telegramId).catch(() => ({ used: 0 })) });
+  } catch (e) {
+    console.error('[account:profile:get]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.put('/api/account/profile', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o || !o.account) return res.status(401).json({ error: 'unauthorized' });
+    const body = req.body || {};
+    const patch = {};
+    if (body.name !== undefined) patch.name = body.name;
+    if (body.phone !== undefined) patch.phone = body.phone;
+    if (body.phoneVerified !== undefined) patch.phoneVerified = !!body.phoneVerified;
+    if (body.altEmail !== undefined) patch.altEmail = body.altEmail;
+    if (body.altEmailVerified !== undefined) patch.altEmailVerified = !!body.altEmailVerified;
+    const profile = await updateAccountProfile(o.account.email, patch);
+    res.json({ ok: true, profile });
+  } catch (e) {
+    console.error('[account:profile:put]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* The tariff is read from the server account; the client only mirrors it. */
+app.get('/api/account/plan', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o || !o.account) return res.status(401).json({ error: 'unauthorized' });
+    res.json({ plan: o.account.plan === 'pro' ? 'pro' : 'free' });
+  } catch (e) {
+    console.error('[account:plan]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* ---------- coach chat history, stored on the server ---------- */
+
+app.get('/api/chat/history', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
+    res.json({ history: await getChatHistory(o.owner) });
+  } catch (e) {
+    console.error('[chat:history:get]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.delete('/api/chat/history', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
+    await mergeStateByOwner(o.owner, { gymai_chat: [] });
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('[chat:history:del]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* ---------- admin: the secret is exchanged for a short-lived token ----------
+   The secret itself never ships in the client. */
+
+const ADMIN_SESSION_HOURS = 12;
+
+function adminSecretOk(req) {
+  const secret = req.headers['x-admin-secret'] || (req.body || {}).admin_secret || '';
+  if (!process.env.ADMIN_SECRET || !safeEqual(secret, process.env.ADMIN_SECRET)) return false;
+  return true;
+}
+
+async function requireAdmin(req, res) {
+  const t = tokenFrom(req);
+  if (!t || !t.startsWith('adm_')) {
+    res.status(401).json({ error: 'unauthorized' });
+    return null;
+  }
+  const sess = await getAdminSession(t);
+  if (!sess) {
+    res.status(401).json({ error: 'unauthorized' });
+    return null;
+  }
+  return sess;
+}
+
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    if (!adminSecretOk(req)) return res.status(403).json({ error: 'forbidden' });
+    const token = 'adm_' + crypto.randomBytes(24).toString('hex');
+    const expires = new Date(Date.now() + ADMIN_SESSION_HOURS * 3600000).toISOString();
+    await saveAdminSession(token, expires);
+    res.json({ ok: true, token, expires_at: expires });
+  } catch (e) {
+    console.error('[admin:login]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/admin/logout', async (req, res) => {
+  try {
+    const t = tokenFrom(req);
+    if (t) await deleteAdminSession(t);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.get('/api/admin/accounts', async (req, res) => {
+  try {
+    if (!(await requireAdmin(req, res))) return;
+    const accounts = await listAccounts();
+    res.json({ ok: true, accounts, count: accounts.length });
+  } catch (e) {
+    console.error('[admin:accounts]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* Grant or revoke Pro for an account (by email). The old telegram_id route
+   stays for compatibility. */
+app.post('/api/admin/plan', async (req, res) => {
+  try {
+    const t = tokenFrom(req);
+    let ok = false;
+    if (t && t.startsWith('adm_')) {
+      ok = !!(await getAdminSession(t));
+    } else {
+      ok = adminSecretOk(req);
+    }
+    if (!ok) return res.status(403).json({ error: 'forbidden' });
+
+    const { telegram_id, email, plan } = req.body || {};
+    if (!['free', 'pro'].includes(plan)) {
+      return res.status(400).json({ error: 'bad_request' });
+    }
+    if (email) {
+      const p = await setAccountPlan(String(email).trim().toLowerCase(), plan);
+      if (!p) return res.status(404).json({ error: 'no_account' });
+      return res.json({ ok: true, email: String(email).trim().toLowerCase(), plan: p });
+    }
+    if (telegram_id) {
+      await setPlan(String(telegram_id), plan);
+      return res.json({ ok: true, telegram_id: String(telegram_id), plan });
+    }
+    return res.status(400).json({ error: 'bad_request' });
+  } catch (e) {
+    console.error('[admin:plan]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* Give every free account Pro — handy right after a launch. */
+app.post('/api/admin/grant-all', async (req, res) => {
+  try {
+    if (!(await requireAdmin(req, res))) return;
+    const accounts = await listAccounts();
+    let n = 0;
+    for (const a of accounts) {
+      if (a.plan !== 'pro') {
+        await setAccountPlan(a.email, 'pro');
+        n++;
+      }
+    }
+    res.json({ ok: true, granted: n, total: accounts.length });
+  } catch (e) {
+    console.error('[admin:grant-all]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* Delete a test account (and its state). */
+app.post('/api/admin/delete-account', async (req, res) => {
+  try {
+    if (!(await requireAdmin(req, res))) return;
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ error: 'bad_request' });
+    const e = String(email).trim().toLowerCase();
+    const accounts = await listAccounts();
+    const acc = accounts.find((a) => a.email === e);
+    if (!acc) return res.status(404).json({ error: 'no_account' });
+    const { deleteAccount } = await import('./src/db.js');
+    await deleteAccount(e);
+    res.json({ ok: true, email: e });
+  } catch (e) {
+    console.error('[admin:delete-account]', e.message);
+    res.status(500).json({ error: 'server_error' });
   }
 });
 

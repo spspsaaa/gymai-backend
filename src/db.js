@@ -651,9 +651,7 @@ export async function listAccounts() {
 
     let rows = [];
     try {
-      const r = await client.execute({
-        sql: `SELECT ${sel.join(', ')} FROM accounts ORDER BY created_at DESC`,
-      });
+      const r = await client.execute(`SELECT ${sel.join(', ')} FROM accounts ORDER BY created_at DESC`);
       rows = r.rows || [];
     } catch (e) {
       console.error('[db] listAccounts select failed:', e.message);
@@ -827,6 +825,10 @@ export async function dbDiag() {
     const m = await client.execute("SELECT name FROM sqlite_master WHERE type='table'");
     out.tables.list = (m.rows || []).map((r) => r.name);
   } catch (e) { out.tables.error = e.message; }
+  try {
+    const r = await client.execute('SELECT email, name, phone, phone_verified, alt_email, alt_email_verified, plan, telegram_id, created_at, updated_at FROM accounts ORDER BY created_at DESC');
+    out.listAccounts = { ok: true, count: (r.rows || []).length, first: (r.rows || [])[0] || null };
+  } catch (e) { out.listAccounts = { ok: false, error: e.message }; }
   for (const t of ['accounts', 'users', 'admin_sessions', 'states']) {
     try {
       const ti = await client.execute(`PRAGMA table_info(${t})`);

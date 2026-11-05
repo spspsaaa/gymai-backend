@@ -29,3 +29,18 @@ The app currently calls `/api/...` (same origin). Either:
 
 Simplest: in the app's script, set `const API_BASE='https://your-backend.onrender.com';`
 and use `fetch(API_BASE + '/api/...')`.
+
+## Проверка живой сборки
+
+`scripts/smoke.js` — read-only проверка развёрнутого сервиса: ничего не
+создаёт и не меняет, только убеждается, что бэкенд отвечает, а защищённые
+маршруты отказывают без авторизации.
+
+```
+node scripts/smoke.js                                  # прод
+node scripts/smoke.js http://localhost:3000             # локально
+```
+
+Проверяются: `/health`, отказ без токена на `/api/state`,
+`/api/account/me`, `/api/account/profile`, `/api/admin/accounts`,
+`/api/coach`, отказ на мусорном токене и на битом теле запроса.

@@ -1,0 +1,19 @@
+name: smoke
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Проверить живой бэкенд
+        run: node scripts/smoke.js
+        env:
+          API_BASE: ${{ vars.API_BASE }}

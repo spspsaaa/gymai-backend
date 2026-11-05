@@ -11,9 +11,14 @@ Server for the GYM AI mini app: Telegram auth, state sync, live AI coach.
 - `POST /api/admin/plan` header `x-admin-secret` `{telegram_id, plan}` -> grant/revoke Pro
 
 ## Env
-BOT_TOKEN, TURSO_URL, TURSO_TOKEN, AI_API_KEY, AI_MODEL, AI_BASE, WEBAPP_URL, ADMIN_SECRET, PORT, FREE_COACH_LIMIT.
+BOT_TOKEN, TURSO_URL, TURSO_TOKEN, AI_API_KEY, AI_MODEL, AI_BASE, WEBAPP_URL, ADMIN_SECRET, PORT, FREE_COACH_LIMIT (10).
 
 Without TURSO_* the server stores data in `data/gymai.json` (fine for local dev only).
+
+`FREE_COACH_LIMIT` — дневной лимит сообщений AI-коуча для free. По умолчанию 10,
+в проде задано 10. Клиент показывает то же число (`FREE_DAILY_LIMIT` в
+`js/07-tariff.js`) — при изменении лимита править оба места, иначе UI будет
+врать о числе оставшихся сообщений.
 
 ## Deploy on Render
 1. Push this folder to a GitHub repo.

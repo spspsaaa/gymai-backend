@@ -19,7 +19,10 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
-const FREE_COACH_LIMIT = Number(process.env.FREE_COACH_LIMIT || 20);
+/* Дневной лимит сообщений AI-коуча для тарифа Free.
+   Держим в паре с клиентским FREE_DAILY_LIMIT (js/07-tariff.js) — оба должны
+   быть 10, иначе клиент покажет одно число, а сервер разрешит другое. */
+const FREE_COACH_LIMIT = Number(process.env.FREE_COACH_LIMIT || 10);
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED === '1';
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky.agent.mira.tg';
 

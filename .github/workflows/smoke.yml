@@ -16,4 +16,4 @@ jobs:
       - name: Проверить живой бэкенд
         run: node scripts/smoke.js
         env:
-          API_BASE: ${{ vars.API_BASE }}
+          API_BASE: ${{ vars.API_BASE || 'https://gymai-backend-ev1z.onrender.com' }}

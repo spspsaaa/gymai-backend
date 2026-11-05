@@ -605,6 +605,19 @@ app.post('/api/admin/logout', async (req, res) => {
   }
 });
 
+/* Temporary diagnostics: shows what the database actually looks like, so a
+   failing admin panel can be diagnosed without shell access. */
+app.get('/api/admin/diag', async (req, res) => {
+  try {
+    if (!(await requireAdmin(req, res))) return;
+    const { dbDiag } = await import('./src/db.js');
+    res.json(await dbDiag());
+  } catch (e) {
+    console.error('[admin:diag]', e.message);
+    res.status(500).json({ error: 'server_error', message: e.message });
+  }
+});
+
 app.get('/api/admin/accounts', async (req, res) => {
   try {
     if (!(await requireAdmin(req, res))) return;

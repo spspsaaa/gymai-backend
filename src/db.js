@@ -627,14 +627,53 @@ export async function setAccountPlan(email, plan) {
 
 /* Every account on the server, for the admin panel. */
 export async function listAccounts() {
-  if (!useFile) {
-    const r = await client.execute({
-      sql: `SELECT a.email, a.name, a.phone, a.phone_verified, a.alt_email, a.alt_email_verified,
-                   a.plan, a.telegram_id, a.created_at, a.updated_at,
-                   (SELECT COUNT(*) FROM users u WHERE u.telegram_id = a.telegram_id) AS tg_seen
-            FROM accounts a ORDER BY a.created_at DESC`,
-    });
-    return (r.rows || []).map((row) => ({
+  if (!useFile && client) {
+    /* The accounts table gained columns over time (name, phone, alt_email...).
+       A hard-coded SELECT breaks the whole admin panel if one ALTER never
+       landed on an old database, so the column set is checked first and the
+       query is built from what actually exists. */
+    let cols = { email: 1, plan: 1, telegram_id: 1, created_at: 1, updated_at: 1 };
+    try {
+      const pr = await client.execute("PRAGMA table_info(accounts)");
+      const names = (pr.rows || []).map((r) => r.name);
+      if (names.length) {
+        cols = {};
+        for (const n of names) cols[n] = 1;
+      }
+    } catch (e) {
+      console.warn('[db] table_info(accounts) failed, using fallback columns:', e.message);
+    }
+
+    const wanted = ['email', 'name', 'phone', 'phone_verified', 'alt_email', 'alt_email_verified',
+      'plan', 'telegram_id', 'created_at', 'updated_at'];
+    const sel = wanted.filter((c) => cols[c]);
+    if (!sel.includes('email')) sel.unshift('email');
+
+    let rows = [];
+    try {
+      const r = await client.execute({
+        sql: `SELECT ${sel.join(', ')} FROM accounts ORDER BY created_at DESC`,
+      });
+      rows = r.rows || [];
+    } catch (e) {
+      console.error('[db] listAccounts select failed:', e.message);
+      try {
+        const r = await client.execute({ sql: 'SELECT * FROM accounts ORDER BY created_at DESC' });
+        rows = r.rows || [];
+      } catch (e2) { console.error('[db] listAccounts fallback failed:', e2.message); }
+    }
+
+    /* The "seen" flag is only a hint, so a broken subquery must not take the
+       whole list down. */
+    const seen = {};
+    try {
+      const ur = await client.execute('SELECT telegram_id FROM users');
+      for (const u of ur.rows || []) if (u.telegram_id) seen[String(u.telegram_id)] = true;
+    } catch (e) {
+      console.warn('[db] listAccounts users lookup skipped:', e.message);
+    }
+
+    return rows.map((row) => ({
       email: row.email,
       name: row.name || '',
       phone: row.phone || '',
@@ -645,7 +684,7 @@ export async function listAccounts() {
       telegramId: row.telegram_id || null,
       created: row.created_at || null,
       updated: row.updated_at || null,
-      seen: Number(row.tg_seen || 0) > 0,
+      seen: row.telegram_id ? !!seen[String(row.telegram_id)] : false,
     }));
   }
   const db = readFile();
@@ -772,4 +811,31 @@ export async function deleteAccount(email) {
   delete db.__states['acct:' + e];
   writeFile(db);
   return true;
+}
+
+/* Reports the real shape of the database: which tables and columns exist and
+   how many rows they hold. Used to diagnose the admin panel over HTTP. */
+export async function dbDiag() {
+  const out = { mode: !useFile && client ? 'libsql' : 'file', tables: {}, counts: {} };
+  if (!client) {
+    const db = readFile();
+    out.counts.accounts = Object.keys(db.__accounts || {}).length;
+    out.counts.users = Object.keys(db).filter((k) => !k.startsWith('__')).length;
+    return out;
+  }
+  try {
+    const m = await client.execute("SELECT name FROM sqlite_master WHERE type='table'");
+    out.tables.list = (m.rows || []).map((r) => r.name);
+  } catch (e) { out.tables.error = e.message; }
+  for (const t of ['accounts', 'users', 'admin_sessions', 'states']) {
+    try {
+      const ti = await client.execute(`PRAGMA table_info(${t})`);
+      out.tables[t] = (ti.rows || []).map((r) => r.name);
+    } catch (e) { out.tables[t] = 'error: ' + e.message; }
+    try {
+      const c = await client.execute(`SELECT COUNT(*) AS n FROM ${t}`);
+      out.counts[t] = Number((c.rows && c.rows[0] && c.rows[0].n) || 0);
+    } catch (e) { out.counts[t] = 'error: ' + e.message; }
+  }
+  return out;
 }

@@ -605,18 +605,6 @@ app.post('/api/admin/logout', async (req, res) => {
   }
 });
 
-/* Temporary diagnostics: shows what the database actually looks like, so a
-   failing admin panel can be diagnosed without shell access. */
-app.get('/api/admin/diag', async (req, res) => {
-  try {
-    if (!(await requireAdmin(req, res))) return;
-    const { dbDiag } = await import('./src/db.js');
-    res.json(await dbDiag());
-  } catch (e) {
-    console.error('[admin:diag]', e.message);
-    res.status(500).json({ error: 'server_error', message: e.message });
-  }
-});
 
 app.get('/api/admin/accounts', async (req, res) => {
   try {
@@ -701,18 +689,6 @@ app.post('/api/admin/delete-account', async (req, res) => {
 });
 
 /* Admin: grant or revoke Pro. */
-app.post('/api/admin/plan', async (req, res) => {
-  const secret = req.headers['x-admin-secret'] || '';
-  if (!process.env.ADMIN_SECRET || !safeEqual(secret, process.env.ADMIN_SECRET)) {
-    return res.status(403).json({ error: 'forbidden' });
-  }
-  const { telegram_id, plan } = req.body || {};
-  if (!telegram_id || !['free', 'pro'].includes(plan)) {
-    return res.status(400).json({ error: 'bad_request' });
-  }
-  await setPlan(String(telegram_id), plan);
-  res.json({ ok: true, telegram_id: String(telegram_id), plan });
-});
 
 // Malformed JSON, oversized body etc.
 app.use((err, req, res, next) => {

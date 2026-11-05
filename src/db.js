@@ -810,34 +810,3 @@ export async function deleteAccount(email) {
   writeFile(db);
   return true;
 }
-
-/* Reports the real shape of the database: which tables and columns exist and
-   how many rows they hold. Used to diagnose the admin panel over HTTP. */
-export async function dbDiag() {
-  const out = { mode: !useFile && client ? 'libsql' : 'file', tables: {}, counts: {} };
-  if (!client) {
-    const db = readFile();
-    out.counts.accounts = Object.keys(db.__accounts || {}).length;
-    out.counts.users = Object.keys(db).filter((k) => !k.startsWith('__')).length;
-    return out;
-  }
-  try {
-    const m = await client.execute("SELECT name FROM sqlite_master WHERE type='table'");
-    out.tables.list = (m.rows || []).map((r) => r.name);
-  } catch (e) { out.tables.error = e.message; }
-  try {
-    const r = await client.execute('SELECT email, name, phone, phone_verified, alt_email, alt_email_verified, plan, telegram_id, created_at, updated_at FROM accounts ORDER BY created_at DESC');
-    out.listAccounts = { ok: true, count: (r.rows || []).length, first: (r.rows || [])[0] || null };
-  } catch (e) { out.listAccounts = { ok: false, error: e.message }; }
-  for (const t of ['accounts', 'users', 'admin_sessions', 'states']) {
-    try {
-      const ti = await client.execute(`PRAGMA table_info(${t})`);
-      out.tables[t] = (ti.rows || []).map((r) => r.name);
-    } catch (e) { out.tables[t] = 'error: ' + e.message; }
-    try {
-      const c = await client.execute(`SELECT COUNT(*) AS n FROM ${t}`);
-      out.counts[t] = Number((c.rows && c.rows[0] && c.rows[0].n) || 0);
-    } catch (e) { out.counts[t] = 'error: ' + e.message; }
-  }
-  return out;
-}

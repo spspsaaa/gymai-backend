@@ -1,0 +1,53 @@
+# Render blueprint for the GYM AI backend.
+#
+# The service already exists and is connected to this repository, so Render
+# keeps using it — this file only documents how the service must be built and
+# which environment variables it expects. Secrets are marked sync: false:
+# their values live in the Render dashboard and are never committed.
+
+services:
+  - type: web
+    name: gymai-backend
+    runtime: node
+    plan: free
+    region: frankfurt
+    branch: main
+    repo: https://github.com/spspsaaa/gymai-backend
+    autoDeploy: true
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      # --- secrets: set the value in the Render dashboard, leave blank here ---
+      - key: BOT_TOKEN
+        sync: false
+      - key: TG_WEBHOOK_SECRET
+        sync: false
+      - key: TURSO_URL
+        sync: false
+      - key: TURSO_TOKEN
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: ADMIN_SECRET
+        sync: false
+
+      # --- plain values: safe to keep in the repo ---
+      # Telegram initData signature check stays ON in production: with
+      # ALLOW_UNVERIFIED=1 anyone could impersonate any Telegram user.
+      - key: ALLOW_UNVERIFIED
+        value: "0"
+      # Daily AI coach messages for the Free plan. Must match the client
+      # constant FREE_DAILY_LIMIT (js/07-tariff.js) — both are 10.
+      - key: FREE_COACH_LIMIT
+        value: "10"
+      # How long a Telegram session token stays valid, in days. The token is
+      # re-issued on every /api/auth, so a leaked one expires quickly.
+      - key: SESSION_TTL_DAYS
+        value: "30"
+      - key: AI_BASE
+        value: https://openrouter.ai/api/v1
+      - key: AI_MODEL
+        value: nvidia/nemotron-3-ultra-550b-a55b:free
+      - key: WEBAPP_URL
+        value: https://gym-ai-3f0d63ky.agent.mira.tg

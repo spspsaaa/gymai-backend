@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   token       TEXT PRIMARY KEY,
   telegram_id TEXT,
   user_json   TEXT,
-  created_at  TEXT DEFAULT (datetime('now'))
+  created_at  TEXT DEFAULT (datetime('now')),
+  expires_at  TEXT
 );
 CREATE TABLE IF NOT EXISTS users (
   telegram_id TEXT PRIMARY KEY,
@@ -56,12 +57,28 @@ CREATE TABLE IF NOT EXISTS admin_sessions (
   created_at TEXT DEFAULT (datetime('now')),
   expires_at TEXT
 );
+CREATE TABLE IF NOT EXISTS exercises (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  slug        TEXT UNIQUE,
+  icon        TEXT,
+  name_ru     TEXT NOT NULL,
+  name_en     TEXT,
+  muscle      TEXT,
+  sets        INTEGER DEFAULT 3,
+  reps        INTEGER DEFAULT 10,
+  weight      TEXT DEFAULT '20',
+  is_custom   INTEGER DEFAULT 0,
+  owner       TEXT,
+  created_at  TEXT DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_exercises_owner ON exercises(owner);
+CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_accounts_tg ON accounts(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_exp ON admin_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_acct_sess_email ON account_sessions(email);
 `;
 
-const COLS = ['username', 'first_name', 'lang', 'plan', 'coach_used', 'state'];
+const COLS = ['username', 'first_name', 'lang', 'plan', 'coach_used', 'state', 'role'];
 
 let client = null;
 let useFile = false;
@@ -91,6 +108,14 @@ export async function init() {
       catch (e) { /* column already exists */ }
     }
     try { await client.execute("ALTER TABLE users ADD COLUMN coach_date TEXT"); }
+    catch (e) { /* column already exists */ }
+    /* Added later: sessions must expire, and a role column lets the API
+       distinguish an admin from a regular user without a second lookup. */
+    try { await client.execute("ALTER TABLE sessions ADD COLUMN expires_at TEXT"); }
+    catch (e) { /* column already exists */ }
+    try { await client.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'"); }
+    catch (e) { /* column already exists */ }
+    try { await client.execute("ALTER TABLE accounts ADD COLUMN role TEXT DEFAULT 'user'"); }
     catch (e) { /* column already exists */ }
     try {
       await client.execute(
@@ -190,6 +215,7 @@ export async function setPlan(id, plan) {
    Returns { ok, counted, used }. Pro users are never counted.
    If the AI call fails afterwards, call refundCoach(). */
 export async function reserveCoach(id, limit) {
+  const lim = Number(limit);
   let u = await getUser(id);
   if (!u) {
     await upsertUser(id, { plan: 'free', coach_used: 0 });
@@ -200,24 +226,45 @@ export async function reserveCoach(id, limit) {
   /* The counter is per calendar day: a new day resets it. */
   const today = new Date().toISOString().slice(0, 10);
   if (!useFile) {
-    await client.execute({
-      sql: `UPDATE users SET coach_used = 0, coach_date = ?, updated_at = datetime('now')
-            WHERE telegram_id = ? AND (coach_date IS NULL OR coach_date != ?)`,
-      args: [today, String(id), today],
-    });
+    /* One atomic statement does the whole job: it resets the counter when the
+       day changed AND increments it only while the limit is not reached.
+       The WHERE clause is the guard — if two requests race, the database
+       serialises them and only one of them sees rowsAffected = 1.
+
+       The previous version read `used` from the row fetched BEFORE the
+       update, so the caller got a stale number: with two parallel requests
+       both saw the same `used`, and the 402 response reported a count that
+       was never reached. Now the count comes back from the same statement
+       that incremented it. */
     const r = await client.execute({
-      sql: `UPDATE users SET coach_used = COALESCE(coach_used, 0) + 1, coach_date = ?, updated_at = datetime('now')
-            WHERE telegram_id = ? AND COALESCE(coach_used, 0) < ?`,
-      args: [today, String(id), Number(limit)],
+      sql: `UPDATE users
+              SET coach_used = CASE WHEN coach_date = ? THEN COALESCE(coach_used, 0) + 1 ELSE 1 END,
+                  coach_date = ?,
+                  updated_at = datetime('now')
+            WHERE telegram_id = ?
+              AND (coach_date = ? OR coach_date IS NULL)
+              AND (CASE WHEN coach_date = ? THEN COALESCE(coach_used, 0) ELSE 0 END) < ?`,
+      args: [today, today, String(id), today, today, lim],
     });
-    const used = Number(u?.coach_used || 0);
-    if (!r.rowsAffected) return { ok: false, counted: false, used };
-    return { ok: true, counted: true, used: used + 1 };
+    if (!r.rowsAffected) {
+      /* The guard blocked the update: the limit is reached. Read the real
+         counter for the answer — it is the value the user will see. */
+      const cur = await getUser(id);
+      const used = cur && cur.coach_date === today ? Number(cur.coach_used || 0) : 0;
+      return { ok: false, counted: false, used };
+    }
+    /* Read back the value this very statement wrote. */
+    const after = await client.execute({
+      sql: 'SELECT coach_used, coach_date FROM users WHERE telegram_id = ?',
+      args: [String(id)],
+    });
+    const row = after.rows[0];
+    return { ok: true, counted: true, used: Number(row?.coach_used || 0) };
   }
   const db = readFile();
   const rec = db[String(id)] || {};
   const used = rec.coach_date === today ? Number(rec.coach_used || 0) : 0;
-  if (used >= Number(limit)) return { ok: false, counted: false, used };
+  if (used >= lim) return { ok: false, counted: false, used };
   db[String(id)] = { ...rec, coach_used: used + 1, coach_date: today, telegram_id: String(id) };
   writeFile(db);
   return { ok: true, counted: true, used: used + 1 };
@@ -239,31 +286,65 @@ export async function refundCoach(id) {
 }
 
 /* ---- persistent sessions (survive Render restarts / free-plan sleeps) ---- */
-export async function saveSession(token, user) {
+export async function saveSession(token, user, expiresAt) {
+  const exp = expiresAt ? String(expiresAt) : null;
   if (!useFile) {
     await client.execute({
-      sql: 'INSERT OR REPLACE INTO sessions (token, telegram_id, user_json) VALUES (?, ?, ?)',
-      args: [token, String(user.id), JSON.stringify(user)],
+      sql: 'INSERT OR REPLACE INTO sessions (token, telegram_id, user_json, expires_at) VALUES (?, ?, ?, ?)',
+      args: [token, String(user.id), JSON.stringify(user), exp],
     });
     return;
   }
   const db = readFile();
   db.__sessions = db.__sessions || {};
-  db.__sessions[token] = user;
+  db.__sessions[token] = { user, expires_at: exp };
   writeFile(db);
 }
 
 export async function getSession(token) {
+  const t = String(token || '');
+  if (!t) return null;
   if (!useFile) {
     const r = await client.execute({
-      sql: 'SELECT user_json FROM sessions WHERE token = ?',
-      args: [String(token)],
+      sql: 'SELECT user_json, expires_at FROM sessions WHERE token = ?',
+      args: [t],
     });
-    if (!r.rows[0]) return null;
-    try { return JSON.parse(r.rows[0].user_json); } catch (e) { return null; }
+    const row = r.rows[0];
+    if (!row) return null;
+    /* An expired session is deleted and treated as missing. Sessions used to
+       live forever, so a leaked token stayed valid indefinitely. */
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) {
+      await client.execute({ sql: 'DELETE FROM sessions WHERE token = ?', args: [t] });
+      return null;
+    }
+    try { return JSON.parse(row.user_json); } catch (e) { return null; }
   }
   const db = readFile();
-  return (db.__sessions || {})[String(token)] || null;
+  const rec = (db.__sessions || {})[t];
+  if (!rec) return null;
+  /* Older rows stored the user object directly, without a wrapper. */
+  if (rec.expires_at && new Date(rec.expires_at).getTime() < Date.now()) {
+    delete db.__sessions[t]; writeFile(db); return null;
+  }
+  return rec.user || rec;
+}
+
+/* The deadline of a session, without loading the user payload. The server
+   uses it to keep its in-memory cache in sync with the database. */
+export async function getSessionMeta(token) {
+  const t = String(token || '');
+  if (!t) return null;
+  if (!useFile) {
+    const r = await client.execute({
+      sql: 'SELECT expires_at FROM sessions WHERE token = ?',
+      args: [t],
+    });
+    return r.rows[0] || null;
+  }
+  const db = readFile();
+  const rec = (db.__sessions || {})[t];
+  if (!rec) return null;
+  return { expires_at: rec.expires_at || null };
 }
 
 
@@ -816,4 +897,185 @@ export async function deleteAccount(email) {
    visible from outside. */
 export function storageMode() {
   return useFile ? 'file' : (client ? 'turso' : 'none');
+}
+
+/* ---------- roles ----------
+   A role is a coarse API-level permission: 'user' (default) or 'admin'.
+   The admin panel is not a separate login — it checks this column, so a
+   user promoted in the database can use the API right away, and every
+   admin endpoint reads the role the same way. */
+
+export const ROLES = ['user', 'admin'];
+
+export function normalizeRole(role) {
+  const r = String(role || '').trim().toLowerCase();
+  return ROLES.includes(r) ? r : 'user';
+}
+
+export async function setAccountRole(email, role) {
+  const e = String(email || '').trim().toLowerCase();
+  const r = normalizeRole(role);
+  const acc = await getAccountByEmail(e);
+  if (!acc) return null;
+  if (!useFile) {
+    await client.execute({
+      sql: "UPDATE accounts SET role = ?, updated_at = datetime('now') WHERE email = ?",
+      args: [r, e],
+    });
+    if (acc.telegram_id) {
+      await client.execute({
+        sql: "UPDATE users SET role = ?, updated_at = datetime('now') WHERE telegram_id = ?",
+        args: [r, String(acc.telegram_id)],
+      });
+    }
+  } else {
+    const db = readFile();
+    db.__accounts = db.__accounts || {};
+    const a = db.__accounts[e] = db.__accounts[e] || {};
+    a.role = r;
+    if (acc.telegram_id) {
+      db[acc.telegram_id] = { ...(db[acc.telegram_id] || {}), role: r, telegram_id: String(acc.telegram_id) };
+    }
+    writeFile(db);
+  }
+  return r;
+}
+
+export async function getAccountRole(email) {
+  const acc = await getAccountByEmail(email);
+  if (!acc) return null;
+  return normalizeRole(acc.role);
+}
+
+/* The role of the account behind a session token, or of a telegram user. */
+export async function roleForOwner(owner) {
+  const o = String(owner || '');
+  if (o.startsWith('acct:')) {
+    const acc = await getAccountByEmail(o.slice(5));
+    return acc ? normalizeRole(acc.role) : 'user';
+  }
+  if (o.startsWith('tg:')) {
+    const u = await getUser(o.slice(3));
+    return u ? normalizeRole(u.role) : 'user';
+  }
+  return 'user';
+}
+
+export async function setUserRole(telegramId, role) {
+  const id = String(telegramId || '');
+  if (!id) return null;
+  const r = normalizeRole(role);
+  if (!useFile) {
+    await client.execute({
+      sql: "UPDATE users SET role = ?, updated_at = datetime('now') WHERE telegram_id = ?",
+      args: [r, id],
+    });
+  } else {
+    const db = readFile();
+    db[id] = { ...(db[id] || {}), role: r, telegram_id: id };
+    writeFile(db);
+  }
+  return r;
+}
+
+
+/* ---------- exercises: the shared catalog ----------
+   The client ships its own catalog (BASE_PLANS) and keeps custom exercises
+   in localStorage. This table holds the server-side catalog so the same
+   exercises are available on every device, and so the coach can look up
+   an exercise by name. owner = null means a built-in exercise. */
+
+function exerciseFromRow(row) {
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    slug: row.slug || '',
+    icon: row.icon || '',
+    name_ru: row.name_ru || '',
+    name_en: row.name_en || '',
+    muscle: row.muscle || '',
+    sets: Number(row.sets || 3),
+    reps: Number(row.reps || 10),
+    weight: row.weight || '20',
+    is_custom: Number(row.is_custom || 0) === 1,
+    owner: row.owner || null,
+  };
+}
+
+export async function listExercises(owner, query) {
+  const q = String(query || '').trim().toLowerCase();
+  if (!useFile) {
+    let sql = 'SELECT * FROM exercises WHERE (owner IS NULL OR owner = ?)';
+    const args = [String(owner || '')];
+    if (q) {
+      sql += ' AND (LOWER(name_ru) LIKE ? OR LOWER(name_en) LIKE ? OR LOWER(muscle) LIKE ?)';
+      args.push('%' + q + '%', '%' + q + '%', '%' + q + '%');
+    }
+    sql += ' ORDER BY is_custom ASC, name_ru ASC';
+    const r = await client.execute({ sql, args });
+    return r.rows.map(exerciseFromRow);
+  }
+  const db = readFile();
+  let all = db.__exercises || [];
+  all = all.filter((x) => !x.owner || x.owner === String(owner || ''));
+  if (q) {
+    all = all.filter((x) =>
+      String(x.name_ru || '').toLowerCase().includes(q) ||
+      String(x.name_en || '').toLowerCase().includes(q) ||
+      String(x.muscle || '').toLowerCase().includes(q));
+  }
+  return all.map(exerciseFromRow);
+}
+
+export async function saveExercise(owner, ex) {
+  const o = String(owner || '');
+  const nameRu = String(ex?.name_ru || '').trim();
+  if (!nameRu) return null;
+  const nameEn = String(ex?.name_en || '').trim();
+  const slug = String(ex?.slug || nameEn || nameRu)
+    .toLowerCase().replace(/[^a-z0-9а-яё]+/gi, '-').replace(/^-+|-+$/g, '') || String(nameRu);
+  const isCustom = ex?.is_custom ? 1 : 0;
+  const args = [slug, ex?.icon || '', nameRu, nameEn, ex?.muscle || '',
+    Number(ex?.sets || 3), Number(ex?.reps || 10), String(ex?.weight ?? '20'), isCustom, o];
+  if (!useFile) {
+    await client.execute({
+      sql: `INSERT INTO exercises (slug, icon, name_ru, name_en, muscle, sets, reps, weight, is_custom, owner)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(slug) DO UPDATE SET
+              icon = excluded.icon, name_ru = excluded.name_ru, name_en = excluded.name_en,
+              muscle = excluded.muscle, sets = excluded.sets, reps = excluded.reps,
+              weight = excluded.weight, is_custom = excluded.is_custom, owner = excluded.owner`,
+      args,
+    });
+    const r = await client.execute({ sql: 'SELECT * FROM exercises WHERE slug = ?', args: [slug] });
+    return exerciseFromRow(r.rows[0]);
+  }
+  const db = readFile();
+  db.__exercises = db.__exercises || [];
+  const i = db.__exercises.findIndex((x) => x.slug === slug);
+  const rec = { slug, icon: ex?.icon || '', name_ru: nameRu, name_en: nameEn,
+    muscle: ex?.muscle || '', sets: Number(ex?.sets || 3), reps: Number(ex?.reps || 10),
+    weight: String(ex?.weight ?? '20'), is_custom: isCustom, owner: o };
+  if (i >= 0) { rec.id = db.__exercises[i].id; db.__exercises[i] = rec; }
+  else { rec.id = (db.__exercises.reduce((m, x) => Math.max(m, Number(x.id || 0)), 0)) + 1; db.__exercises.push(rec); }
+  writeFile(db);
+  return exerciseFromRow(rec);
+}
+
+export async function deleteExercise(owner, id) {
+  const oid = String(owner || '');
+  if (!useFile) {
+    const r = await client.execute({
+      sql: 'DELETE FROM exercises WHERE id = ? AND (owner IS NULL OR owner = ?)',
+      args: [Number(id), oid],
+    });
+    return r.rowsAffected > 0;
+  }
+  const db = readFile();
+  const all = db.__exercises || [];
+  const i = all.findIndex((x) => Number(x.id) === Number(id) && (x.owner === null || x.owner === oid));
+  if (i < 0) return false;
+  all.splice(i, 1);
+  writeFile(db);
+  return true;
 }

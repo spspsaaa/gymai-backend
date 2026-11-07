@@ -3,14 +3,16 @@ import cors from 'cors';
 import crypto from 'node:crypto';
 import {
   init, getUser, upsertUser, saveState, mergeState, setPlan, getState,
-  saveSession, getSession, reserveCoach, refundCoach,
+  saveSession, getSession, getSessionMeta, reserveCoach, refundCoach,
   hashPassword, verifyPassword, getAccountByEmail, getAccountByTelegram,
   createAccount, linkAccountToTelegram,
   saveAccountSession, getAccountSession, deleteAccountSession,
   getStateByOwner, saveStateByOwner, mergeStateByOwner, migrateState,
   getAccountProfile, updateAccountProfile, setAccountPlan, listAccounts,
   saveAdminSession, getAdminSession, deleteAdminSession,
-  getChatHistory, appendChat, coachUsage, storageMode} from './src/db.js';
+  getChatHistory, appendChat, coachUsage, storageMode,
+  ROLES, normalizeRole, setAccountRole, getAccountRole, roleForOwner, setUserRole,
+  listExercises, saveExercise, deleteExercise} from './src/db.js';
 import { verifyInitData, userFromInitDataUnverified } from './src/telegram.js';
 import { askCoach } from './src/ai.js';
 
@@ -24,6 +26,10 @@ const BOT_TOKEN = process.env.BOT_TOKEN || '';
    быть 10, иначе клиент покажет одно число, а сервер разрешит другое. */
 const FREE_COACH_LIMIT = Number(process.env.FREE_COACH_LIMIT || 10);
 const ALLOW_UNVERIFIED = process.env.ALLOW_UNVERIFIED === '1';
+/* How long a Telegram session token stays valid. The account session lives
+   much longer; this one is re-issued on every /api/auth, so a leaked token
+   expires quickly instead of staying valid forever. */
+const SESSION_TTL_DAYS = Number(process.env.SESSION_TTL_DAYS || 30);
 const WEBAPP_URL = process.env.WEBAPP_URL || 'https://gym-ai-3f0d63ky.agent.mira.tg';
 
 function safeEqual(a, b) {
@@ -140,9 +146,27 @@ function tokenFrom(req) {
 async function userFromToken(req) {
   const t = tokenFrom(req);
   if (!t) return null;
-  if (sessions.has(t)) return sessions.get(t);
+  const cached = sessions.get(t);
+  if (cached) {
+    /* The in-memory cache must not outlive the token it stands for. */
+    if (cached.expiresAt && new Date(cached.expiresAt).getTime() < Date.now()) {
+      sessions.delete(t);
+      return null;
+    }
+    return cached.user || cached;
+  }
   const u = await getSession(t);
-  if (u) sessions.set(t, u);
+  if (u) {
+    /* getSession already rejects expired tokens, but the cache needs the
+       deadline too, otherwise a token would stay valid in RAM for its whole
+       lifetime even after the database row expired. */
+    let expiresAt = null;
+    try {
+      const row = await getSessionMeta(t);
+      expiresAt = row?.expires_at || null;
+    } catch (e) { /* non-fatal */ }
+    sessions.set(t, { user: u, expiresAt });
+  }
   return u || null;
 }
 
@@ -191,8 +215,9 @@ app.post('/api/auth', async (req, res) => {
     }
 
     const token = newToken();
-    sessions.set(token, u);
-    await saveSession(token, u);
+    const expiresAt = new Date(Date.now() + SESSION_TTL_DAYS * 86400000).toISOString();
+    sessions.set(token, { user: u, expiresAt });
+    await saveSession(token, u, expiresAt);
     res.json({
       token,
       user: {
@@ -577,18 +602,32 @@ function adminSecretOk(req) {
   return true;
 }
 
-async function requireAdmin(req, res) {
+/* The single place that decides whether a request may act as an admin.
+   Every admin endpoint goes through this, so the rule cannot drift between
+   them: a request is an admin when it carries a valid admin session token,
+   when it presents ADMIN_SECRET directly, or when the account behind the
+   token has the 'admin' role in the database. */
+async function isAdminRequest(req) {
   const t = tokenFrom(req);
-  if (!t || !t.startsWith('adm_')) {
-    res.status(401).json({ error: 'unauthorized' });
-    return null;
+  if (t && t.startsWith('adm_')) {
+    if (await getAdminSession(t)) return true;
   }
-  const sess = await getAdminSession(t);
-  if (!sess) {
-    res.status(401).json({ error: 'unauthorized' });
-    return null;
-  }
-  return sess;
+  if (adminSecretOk(req)) return true;
+  /* Role-based access: the account or telegram user behind the token. */
+  try {
+    const o = await resolveOwner(req);
+    if (o && o.owner) {
+      const role = await roleForOwner(o.owner);
+      if (role === 'admin') return true;
+    }
+  } catch (e) { /* fall through to not-admin */ }
+  return false;
+}
+
+async function requireAdminRole(req, res) {
+  if (await isAdminRequest(req)) return true;
+  res.status(403).json({ error: 'forbidden' });
+  return false;
 }
 
 app.post('/api/admin/login', async (req, res) => {
@@ -617,7 +656,7 @@ app.post('/api/admin/logout', async (req, res) => {
 
 app.get('/api/admin/accounts', async (req, res) => {
   try {
-    if (!(await requireAdmin(req, res))) return;
+    if (!(await requireAdminRole(req, res))) return;
     const accounts = await listAccounts();
     res.json({ ok: true, accounts, count: accounts.length });
   } catch (e) {
@@ -630,14 +669,7 @@ app.get('/api/admin/accounts', async (req, res) => {
    stays for compatibility. */
 app.post('/api/admin/plan', async (req, res) => {
   try {
-    const t = tokenFrom(req);
-    let ok = false;
-    if (t && t.startsWith('adm_')) {
-      ok = !!(await getAdminSession(t));
-    } else {
-      ok = adminSecretOk(req);
-    }
-    if (!ok) return res.status(403).json({ error: 'forbidden' });
+    if (!(await requireAdminRole(req, res))) return;
 
     const { telegram_id, email, plan } = req.body || {};
     if (!['free', 'pro'].includes(plan)) {
@@ -662,7 +694,7 @@ app.post('/api/admin/plan', async (req, res) => {
 /* Give every free account Pro — handy right after a launch. */
 app.post('/api/admin/grant-all', async (req, res) => {
   try {
-    if (!(await requireAdmin(req, res))) return;
+    if (!(await requireAdminRole(req, res))) return;
     const accounts = await listAccounts();
     let n = 0;
     for (const a of accounts) {
@@ -681,7 +713,7 @@ app.post('/api/admin/grant-all', async (req, res) => {
 /* Delete a test account (and its state). */
 app.post('/api/admin/delete-account', async (req, res) => {
   try {
-    if (!(await requireAdmin(req, res))) return;
+    if (!(await requireAdminRole(req, res))) return;
     const { email } = req.body || {};
     if (!email) return res.status(400).json({ error: 'bad_request' });
     const e = String(email).trim().toLowerCase();
@@ -717,3 +749,104 @@ init()
     console.error('DB init failed:', e);
     process.exit(1);
   });
+
+
+/* ---------- exercises: the shared catalog ----------
+   The client keeps its own catalog in BASE_PLANS and custom exercises in
+   localStorage. These endpoints put the catalog on the server so the same
+   exercises are available on every device and the coach can look one up. */
+
+app.get('/api/exercises', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    const owner = o ? o.owner : '';
+    const list = await listExercises(owner, req.query.q || '');
+    res.json({ ok: true, exercises: list });
+  } catch (e) {
+    console.error('[exercises:list]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.post('/api/exercises', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
+    const body = req.body || {};
+    const nameRu = String(body.name_ru || '').trim();
+    if (!nameRu) return res.status(400).json({ error: 'bad_request' });
+    const ex = await saveExercise(o.owner, {
+      name_ru: nameRu,
+      name_en: body.name_en,
+      icon: body.icon,
+      muscle: body.muscle,
+      sets: body.sets,
+      reps: body.reps,
+      weight: body.weight,
+      /* An exercise created by a user is always custom and belongs to them. */
+      is_custom: body.is_custom !== undefined ? !!body.is_custom : true,
+      slug: body.slug,
+    });
+    if (!ex) return res.status(400).json({ error: 'bad_request' });
+    res.json({ ok: true, exercise: ex });
+  } catch (e) {
+    console.error('[exercises:save]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+app.delete('/api/exercises/:id', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
+    const ok = await deleteExercise(o.owner, req.params.id);
+    if (!ok) return res.status(404).json({ error: 'no_exercise' });
+    res.json({ ok: true, id: req.params.id });
+  } catch (e) {
+    console.error('[exercises:delete]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* ---------- roles ----------
+   The role of the caller, so the client can show or hide admin-only UI. */
+
+app.get('/api/role', async (req, res) => {
+  try {
+    const o = await resolveOwner(req);
+    if (!o) return res.status(401).json({ error: 'unauthorized' });
+    const role = await roleForOwner(o.owner);
+    res.json({ ok: true, role, owner: o.owner });
+  } catch (e) {
+    console.error('[role:get]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});
+
+/* Admin: grant or revoke the admin role. */
+app.post('/api/admin/role', async (req, res) => {
+  try {
+    if (!(await requireAdminRole(req, res))) return;
+    const { email, telegram_id, role } = req.body || {};
+    const r = normalizeRole(role);
+    if (role && !ROLES.includes(String(role).trim().toLowerCase())) {
+      return res.status(400).json({ error: 'bad_role' });
+    }
+    if (email) {
+      const e = String(email).trim().toLowerCase();
+      const done = await setAccountRole(e, r);
+      if (!done) return res.status(404).json({ error: 'no_account' });
+      return res.json({ ok: true, email: e, role: done });
+    }
+    if (telegram_id) {
+      const id = String(telegram_id);
+      const done = await setUserRole(id, r);
+      if (!done) return res.status(404).json({ error: 'no_user' });
+      return res.json({ ok: true, telegram_id: id, role: done });
+    }
+    return res.status(400).json({ error: 'bad_request' });
+  } catch (e) {
+    console.error('[admin:role]', e.message);
+    res.status(500).json({ error: 'server_error' });
+  }
+});

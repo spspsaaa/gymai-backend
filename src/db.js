@@ -72,7 +72,6 @@ CREATE TABLE IF NOT EXISTS exercises (
   created_at  TEXT DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_exercises_owner ON exercises(owner);
-CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_accounts_tg ON accounts(telegram_id);
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_exp ON admin_sessions(expires_at);
 CREATE INDEX IF NOT EXISTS idx_acct_sess_email ON account_sessions(email);
@@ -117,6 +116,15 @@ export async function init() {
     catch (e) { /* column already exists */ }
     try { await client.execute("ALTER TABLE accounts ADD COLUMN role TEXT DEFAULT 'user'"); }
     catch (e) { /* column already exists */ }
+    /* The index on expires_at must be created AFTER the column exists.
+       It used to live in SCHEMA, and SCHEMA runs as one batch before the
+       migrations — on an existing database the column was not there yet, so
+       the whole batch failed with "no such column: expires_at" and the
+       server never started. */
+    try { await client.execute('CREATE INDEX IF NOT EXISTS idx_sessions_exp ON sessions(expires_at)'); }
+    catch (e) { console.warn('[db] idx_sessions_exp skipped:', e.message); }
+    try { await client.execute('CREATE INDEX IF NOT EXISTS idx_exercises_owner ON exercises(owner)'); }
+    catch (e) { console.warn('[db] idx_exercises_owner skipped:', e.message); }
     try {
       await client.execute(
         "INSERT OR IGNORE INTO states (owner, state, updated_at) " +

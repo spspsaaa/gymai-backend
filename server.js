@@ -220,6 +220,9 @@ app.post('/api/auth', async (req, res) => {
     await saveSession(token, u, expiresAt);
     res.json({
       token,
+      /* The client needs the deadline to know when to ask for a new token
+         instead of waiting for a 401. */
+      expires_at: expiresAt,
       user: {
         id: u.id,
         username: u.username,
